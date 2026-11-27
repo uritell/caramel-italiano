@@ -232,9 +232,16 @@ If 12 minutes after create the container uptime is still 0 or less, or
 that proxy URL has not answered, the launcher terminates the pod and
 exits non-zero. A crash loop must not run until the 2.5 hour cap.
 
-What comes back: `best.pt` (or the safetensors export), four sample wavs,
-logs, `speed.json`, `eval.json`, and the attribution note. The optimizer
-checkpoint stays on the pod and is deleted with it. Raw audio is not copied.
+What comes back, in this order: the `caramel-it` export, `best.pt`, the
+sample wavs, the logs, then `eval.json`, plus the smaller notes. Each file
+is written to disk in 1 MB pieces, so a checkpoint is never held whole in
+the launcher. The optimizer `ckpt.pt` stays on the pod unless you pass
+`--include-checkpoints`. Raw audio is not copied.
+
+If the launcher is killed while it is copying, the in-pod watchdog still
+terminates the pod after `DONE` or `FAILED` and the pull grace (10 minutes
+by default). A SIGTERM on the box also terminates the pod. A kernel OOM
+kill cannot be caught here; the watchdog is what stops the bill.
 
 Files land in `runpod/retrieved/<pod-id>/`.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -277,7 +278,10 @@ def check_watchdog_copies() -> None:
     b = _region(HERE / "bootstrap.sh")
     if a != b:
         raise SystemExit("bootstrap.sh watchdog copy drifted from watchdog.sh")
-    for needle in ("podTerminate", "podStop", "api.runpod.io/graphql", "(elapsed * hourly + 3599) / 3600"):
+    for needle in (
+        "podTerminate", "podStop", "api.runpod.io/graphql",
+        "(elapsed * hourly + 3599) / 3600", "job_grace_elapsed",
+    ):
         if needle not in a:
             raise SystemExit(f"watchdog missing {needle}")
     if "rest.runpod.io" in a:
@@ -582,6 +586,139 @@ def check_upload_abort_pulls() -> None:
     print("upload abort pulls ok")
 
 
+def check_stream_pull() -> None:
+    """Files land on disk in chunks, ckpt.pt is skipped, and a proxy flap is retried."""
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    bodies = {
+        "caramel-it/model.safetensors": b"EXPORT-weights-0123456789",
+        "best.pt": b"BEST-weights-abcdefghij",
+        "samples/it_0.wav": b"WAVDATA",
+        "logs/pod_run.log": b"LOGDATA",
+        "eval.json": b"EVALDATA",
+        "status.txt": b"STATDATA",
+        "checkpoints/s2/ckpt.pt": b"CKPT-optimizer-state-should-stay",
+    }
+    hits = {name: 0 for name in bodies}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_HEAD(self):  # noqa: N802
+            rel = self.path.lstrip("/")
+            if rel not in bodies:
+                self._send(404, b"missing")
+                return
+            self._send(200, bodies[rel])
+
+        def do_GET(self):  # noqa: N802
+            if self.path in ("/", ""):
+                payload = json.dumps({"files": sorted(bodies)}).encode()
+                self._send(200, payload)
+                return
+            rel = self.path.lstrip("/")
+            hits[rel] = hits.get(rel, 0) + 1
+            if rel == "caramel-it/model.safetensors" and hits[rel] == 1:
+                self._send(502, b"")
+                return
+            if rel == "best.pt" and hits[rel] == 1:
+                self._send(404, b"")
+                return
+            if rel not in bodies:
+                self._send(404, b"missing file")
+                return
+            self._send(200, bodies[rel])
+
+        def log_message(self, fmt, *args):
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    held = {"n": 0}
+    original = Path.write_bytes
+
+    def refuse_whole(self, data):
+        held["n"] += 1
+        raise SystemExit(f"pull held {self} in memory ({len(data)} bytes)")
+
+    Path.write_bytes = refuse_whole
+    order = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            ok = launch._pull_http_base(
+                f"http://127.0.0.1:{port}", dest, "tok", include_ckpt=False,
+                chunk_bytes=8, pause=lambda _s: None, attempts=4, on_file=order.append,
+            )
+            if not ok:
+                raise SystemExit("streamed pull returned nothing")
+            if order != [
+                "caramel-it/model.safetensors", "best.pt", "samples/it_0.wav",
+                "logs/pod_run.log", "eval.json", "status.txt",
+            ]:
+                raise SystemExit(f"pull order was {order}")
+            for rel, body in bodies.items():
+                path = dest / rel
+                if rel.endswith("ckpt.pt"):
+                    if path.exists():
+                        raise SystemExit("resume ckpt.pt was pulled by default")
+                    continue
+                if path.read_bytes() != body:
+                    raise SystemExit(f"{rel} was not streamed intact")
+            if hits["caramel-it/model.safetensors"] != 2 or hits["best.pt"] != 2:
+                raise SystemExit(f"proxy flap was not retried: {hits}")
+            if hits["checkpoints/s2/ckpt.pt"] != 0:
+                raise SystemExit("ckpt.pt was requested")
+            again = []
+            launch._pull_http_base(
+                f"http://127.0.0.1:{port}", dest, "tok", include_ckpt=True,
+                chunk_bytes=8, pause=lambda _s: None, attempts=3, on_file=again.append,
+            )
+            if "checkpoints/s2/ckpt.pt" not in again:
+                raise SystemExit(f"--include-checkpoints did not pull ckpt.pt: {again}")
+            if (dest / "checkpoints/s2/ckpt.pt").read_bytes() != bodies["checkpoints/s2/ckpt.pt"]:
+                raise SystemExit("included ckpt.pt did not match")
+    finally:
+        Path.write_bytes = original
+        httpd.shutdown()
+    if held["n"]:
+        raise SystemExit("a pull assembled a file in memory")
+    print("stream pull ok")
+
+
+def check_termination_guard() -> None:
+    """Leaving the launcher, or SIGTERM, still asks for the pod to be deleted."""
+    reasons = []
+    with launch.termination_guard(reasons.append) as once:
+        once("pilot finished")
+    if reasons != ["pilot finished"]:
+        raise SystemExit(f"a finished stop ran twice: {reasons}")
+    reasons.clear()
+    with launch.termination_guard(reasons.append):
+        pass
+    if reasons != ["launcher exiting"]:
+        raise SystemExit(f"an unclean exit did not terminate: {reasons}")
+    reasons.clear()
+    try:
+        with launch.termination_guard(reasons.append):
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise SystemExit("SIGTERM was not delivered")
+    except KeyboardInterrupt:
+        pass
+    if reasons != ["signal 15"]:
+        raise SystemExit(f"SIGTERM did not terminate the pod: {reasons}")
+    print("termination guard ok")
+
+
 def main() -> int:
     check_cost()
     check_option_a()
@@ -595,6 +732,8 @@ def main() -> int:
     check_proxy_retry_and_pull()
     check_upload_proxy_retry()
     check_upload_abort_pulls()
+    check_stream_pull()
+    check_termination_guard()
     print("self-check ok")
     return 0
 

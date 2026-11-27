@@ -154,7 +154,22 @@ self_test() {
     echo "watchdog self-test failed: 1.9h should trip the option A wall" >&2
     exit 1
   fi
+  # A finished job must die after the pull grace even if the box launcher is gone.
+  if ! job_grace_elapsed 600 600; then
+    echo "watchdog self-test failed: a finished job at the grace must terminate" >&2
+    exit 1
+  fi
+  if job_grace_elapsed 599 600; then
+    echo "watchdog self-test failed: a finished job inside the grace must stay up" >&2
+    exit 1
+  fi
   echo "watchdog ok (bash)"
+}
+
+job_grace_elapsed() {
+  # $1 seconds since DONE or FAILED, $2 pull grace seconds.
+  local age="$1" grace="$2"
+  (( age >= grace ))
 }
 
 flush_artifacts() {
@@ -224,6 +239,27 @@ while true; do
     terminate_pod && exit 0
     sleep 15
     continue
+  fi
+  # The box process can be killed while it is copying files. DONE/FAILED plus
+  # the pull grace is enough; this loop does not need the launcher to be alive.
+  out="${PILOT_OUT:-/workspace/pilot-out}"
+  grace="${PILOT_PULL_GRACE_S:-600}"
+  mark=""
+  if [[ -f "$out/DONE" ]]; then
+    mark="$out/DONE"
+  elif [[ -f "$out/FAILED" ]]; then
+    mark="$out/FAILED"
+  fi
+  if [[ -n "$mark" ]]; then
+    mtime=$(stat -c %Y "$mark" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    if (( age < 0 )); then age=0; fi
+    if job_grace_elapsed "$age" "$grace"; then
+      echo "watchdog job finished ${age}s ago (grace ${grace}s); terminating"
+      terminate_pod && exit 0
+      sleep 15
+      continue
+    fi
   fi
   sleep 20
 done
