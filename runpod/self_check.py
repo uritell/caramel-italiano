@@ -84,6 +84,46 @@ def check_graphql_shape() -> None:
     hidden = {item["key"]: item["value"] for item in launch.redact(body)["env"]}
     if hidden.get("PILOT_PULL_TOKEN") != "***":
         raise SystemExit("pull token was not redacted")
+    queries = "\n".join((
+        graphql_api.GPU_QUOTE, graphql_api.POD_CORE, graphql_api.POD_STATUS,
+        graphql_api.CREATE, graphql_api.STATUS, graphql_api.STOP, graphql_api.TERMINATE,
+    ))
+    for banned in graphql_api._HOST_ONLY_FIELDS:
+        if banned in queries:
+            raise SystemExit(f"query still selects host-only field {banned}")
+    if "availableGpuCount" in queries:
+        raise SystemExit("availableGpuCount is still selected")
+    if "securePrice" not in graphql_api.GPU_QUOTE:
+        raise SystemExit("GPU quote no longer reads securePrice")
+    kept = graphql_api.quote_from_payload({
+        "data": {"gpuTypes": [{"id": "NVIDIA H100 80GB HBM3", "securePrice": 4.39}]},
+        "errors": [{
+            "message": "Not authorized. Missing required scope(s): CSR_READ, HOST_DAEMON",
+            "path": ["gpuTypes", 0, "lowestPrice", "availableGpuCount"],
+        }],
+    })
+    if kept[0].get("securePrice") != 4.39 or not kept[1]:
+        raise SystemExit("optional field error dropped a quote that had securePrice")
+    try:
+        graphql_api.quote_from_payload({
+            "data": {"gpuTypes": [{"id": "NVIDIA H100 80GB HBM3"}]},
+            "errors": [{
+                "message": "Not authorized",
+                "path": ["gpuTypes", 0, "securePrice"],
+            }],
+        })
+    except graphql_api.ApiError:
+        pass
+    else:
+        raise SystemExit("an error on securePrice was treated as optional")
+    try:
+        graphql_api.quote_from_payload({
+            "errors": [{"message": "Not authorized", "path": ["gpuTypes", 0, "lowestPrice", "availableGpuCount"]}],
+        })
+    except graphql_api.ApiError:
+        pass
+    else:
+        raise SystemExit("a field error with no securePrice was ignored")
     print("graphql shape ok")
 
 

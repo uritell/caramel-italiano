@@ -108,6 +108,8 @@ All four operations use GraphQL at `https://api.runpod.io/graphql`:
 | Stop (not used by the cap) | `podStop` |
 | Terminate | `podTerminate` |
 
+The price check reads `securePrice`, plus the public `uninterruptablePrice` and `stockStatus`. It does not request live stock counts. If one of those extra fields is rejected and `securePrice` is still in the response, the quote is kept.
+
 The header is `Authorization: Bearer $RUNPOD_API_KEY`. If a GraphQL call
 fails, that one call is retried against `https://api.runpod.io/v2`. The
 old REST host is not used.
