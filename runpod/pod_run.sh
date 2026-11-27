@@ -329,7 +329,10 @@ if "$MODE" == "local":
     cmds = stages.cpu_smoke_commands(py, mono, stereo, dev, runs)
 else:
     cmds = stages.full_commands(py, mono, stereo, dev, runs)
-    stages.assert_full_numbers(cmds)
+    if os.environ.get("PILOT_CONFIG") == "warmstart":
+        stages.assert_warmstart_numbers(cmds)
+    else:
+        stages.assert_full_numbers(cmds)
 stages.run_commands(cmds, Path("$ROOT/third_party/caramel"), Path("$OUT/logs"))
 PY
 publish || true

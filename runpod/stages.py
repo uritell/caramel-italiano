@@ -174,6 +174,24 @@ def format_commands(commands) -> str:
     return "\n\n".join(lines) + "\n"
 
 
+def assert_warmstart_numbers(commands) -> None:
+    """The warmstart commands are not the pilot schedule and must not be judged by it."""
+    names = [name for name, _, _ in commands]
+    if names != ["s2", "s3"]:
+        raise SystemExit(f"warmstart must be stage 2 then stage 3, got {names}")
+    blob = " ".join(" ".join(argv) for _, argv, _ in commands)
+    for needle in ("--init-weights", "--boost-first", "--boost", "1e-4", "--save_best", "--eval_every 100"):
+        if needle not in blob:
+            raise SystemExit(f"warmstart command is missing {needle}")
+    if "1.5e-4" in blob:
+        raise SystemExit("warmstart must not use the pilot learning rate 1.5e-4")
+    for name, argv, env in commands:
+        if env.get("CUDA_VISIBLE_DEVICES") != "0":
+            raise SystemExit(f"{name} must be pinned to one GPU")
+        if "--nproc_per_node" in argv or "torch.distributed.run" in argv:
+            raise SystemExit(f"{name} must not launch a second GPU")
+
+
 def assert_full_numbers(commands) -> None:
     blob = " ".join(" ".join(argv) for _, argv, _ in commands)
     for needle in (
