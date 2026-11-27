@@ -52,6 +52,13 @@ Before any rental, measure:
   frames/s on one H100 with their kernels)
 - tokenization time, which the paper does not publish
 
+A CPU measurement from the smoke run (no GPU, 27 Nov 2026) is in
+`score/comparison.md`. Short clips encoded at about 0.028× real time
+(roughly 36× realtime) on this 4-vCPU box, so the 275 h already
+downloaded would take on the order of 8 CPU-hours. Long stereo files
+have to be chunked and ran at about 0.077× real time per channel.
+That is not a GPU quote. Pilot `--steps` are still unset.
+
 Then set `--steps`, `--stop_at`, `--warmup`, and `--sched_start` so
 that the three stages stay inside the remaining budget (on-demand
 prices checked 27 Nov 2026, USD before tax: roughly $1.73/h Vast.ai
