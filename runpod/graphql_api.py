@@ -338,4 +338,10 @@ def _rest_create_body(pod_input: dict) -> dict:
         "cmd": spec["cmd"],
         "args": pod_input["dockerArgs"],
     }
+    if pod_input.get("dataCenterIds"):
+        body["dataCenterIds"] = list(pod_input["dataCenterIds"])
+    if pod_input.get("countryCode"):
+        body["countryCode"] = pod_input["countryCode"]
+    if pod_input.get("terminateAfter"):
+        body["terminateAfter"] = pod_input["terminateAfter"]
     return body
