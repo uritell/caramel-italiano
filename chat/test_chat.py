@@ -37,14 +37,21 @@ class Cfg:
 class FakeModel:
     def __init__(self, context: int = 8):
         self.cfg = Cfg(context)
+        self.calls = []
 
     def init_state(self, batch, tmax=None):
         return {"pos": torch.zeros((), dtype=torch.long)}
 
     def step(self, st, inp, forced, temp=1.1, top_k=50):
         st["pos"] += 1
+        self.calls.append({
+            "temp": float(temp),
+            "top_k": int(top_k),
+            "forced": forced.detach().cpu().clone(),
+            "human": inp[:, 8:16].detach().cpu().clone(),
+        })
         if int(forced.max()) >= 0:
-            raise AssertionError("the person's codes are inputs, not forced outputs")
+            return forced.clone()
         return (inp[:, 8:16] + 1) % self.cfg.card
 
 
@@ -55,8 +62,10 @@ class FakeMimi:
     def encode(self, input_values, num_quantizers=8, padding_cache=None, use_streaming=None, encoder_cache=None):
         if use_streaming:
             self.streaming = True
+        level = float(input_values.detach().float().abs().mean())
+        code = 2 if level < 1e-4 else min(30, 10 + int(level * 10))
         return SimpleNamespace(
-            audio_codes=torch.full((1, 8, 1), 4, dtype=torch.long),
+            audio_codes=torch.full((1, 8, 1), code, dtype=torch.long),
             padding_cache={"enc": 1},
             encoder_cache={"ok": True},
         )
@@ -105,7 +114,7 @@ def check_loop() -> None:
     first = loop.push(np.zeros(FRAME, dtype=np.float32))
     if first.pcm.size != 0 or first.reset:
         raise SystemExit(f"first frame should be silent, got {first}")
-    second = loop.push(np.full(FRAME, 0.2, dtype=np.float32))
+    second = loop.push(np.full(FRAME, 0.001, dtype=np.float32))
     if second.pcm.size != FRAME or not mimi.streaming:
         raise SystemExit(f"second frame did not return streamed audio: {second.pcm.size} streaming={mimi.streaming}")
     if abs(float(second.pcm[0]) - 0.25) > 1e-5:
@@ -148,6 +157,11 @@ def check_plan() -> None:
     keys = {item["key"] for item in body["env"]}
     if "RUNPOD_API_KEY" in keys:
         raise SystemExit("chat pod env contains RUNPOD_API_KEY")
+    values = {item["key"]: item["value"] for item in body["env"]}
+    if values.get("CHAT_TEMP") != "0.75" or values.get("CHAT_TOP_K") != "25":
+        raise SystemExit(f"launcher sampling defaults drifted: {values.get('CHAT_TEMP')} {values.get('CHAT_TOP_K')}")
+    if values.get("PILOT_MAX_USD_CENTS") != "150" or values.get("PILOT_MAX_SECONDS") != "3600":
+        raise SystemExit("chat caps changed")
     if body["containerDiskInGb"] != 40 or body["gpuCount"] != 1:
         raise SystemExit("disk or gpu count is wrong")
     if "EU-RO-1" not in body["dataCenterIds"]:
@@ -274,6 +288,50 @@ async def check_server() -> None:
     if idle_reasons != ["idle"]:
         raise SystemExit(f"idle shutdown did not fire: {idle_reasons}")
     print("server ok")
+
+
+def check_gate() -> None:
+    model = FakeModel()
+    loop = LiveLoop(model, FakeMimi(), hangover_ms=80)
+    if loop.temp != 0.75 or loop.top_k != 25 or not loop.gate_enabled:
+        raise SystemExit("defaults are not temperature 0.75, top_k 25, gate on")
+    loop.push(np.zeros(FRAME, dtype=np.float32))
+    quiet = model.calls[-1]
+    if quiet["temp"] != 0.75 or quiet["top_k"] != 25 or int(quiet["forced"].max()) >= 0:
+        raise SystemExit(f"quiet frame was not sampled at 0.75/25: {quiet['temp']} {quiet['top_k']}")
+    loud = np.full(FRAME, 0.5, dtype=np.float32)
+    heard = loop.push(loud)
+    if heard.pcm.size != FRAME or float(np.max(np.abs(heard.pcm))) != 0.0:
+        raise SystemExit("speech above the threshold was still audible")
+    silence = loop._silence.detach().cpu().reshape(-1)
+    if not torch.equal(model.calls[-1]["forced"].reshape(-1), silence):
+        raise SystemExit("the gate did not force silence tokens")
+    loop.push(loud)
+    human = model.calls[-1]["human"].reshape(-1)
+    if int(human[0]) == int(silence[0]):
+        raise SystemExit("the person's codes were replaced by the silence tokens")
+    if int(model.calls[-1]["forced"].min()) < 0 or float(np.max(np.abs(loop.push(np.zeros(FRAME, dtype=np.float32)).pcm))) != 0.0:
+        raise SystemExit("the hangover did not keep the model quiet")
+    # The line above consumed the hangover frame. This one should sample again.
+    loop.push(np.zeros(FRAME, dtype=np.float32))
+    if int(model.calls[-1]["forced"].max()) >= 0:
+        raise SystemExit("sampling did not resume after the hangover")
+    loop.set_sampling(temp=0.4, top_k=10)
+    loop.push(np.zeros(FRAME, dtype=np.float32))
+    if model.calls[-1]["temp"] != 0.4 or model.calls[-1]["top_k"] != 10:
+        raise SystemExit("a sampling change was not passed into Model.step")
+    if len(model.calls) < 5:
+        raise SystemExit("Model.step was skipped while the gate was closed")
+    os.environ["CHAT_TEMP"] = "0.55"
+    os.environ["CHAT_TOP_K"] = "12"
+    try:
+        got = server.settings_from_env()
+    finally:
+        os.environ.pop("CHAT_TEMP", None)
+        os.environ.pop("CHAT_TOP_K", None)
+    if got["temp"] != 0.55 or got["top_k"] != 12 or got["hangover_ms"] != 500:
+        raise SystemExit(f"env settings were not read: {got}")
+    print("turn taking ok")
 
 
 def check_upload_fail_fast() -> None:
@@ -406,6 +464,7 @@ async def check_chunked_upload() -> None:
 
 def main() -> int:
     check_loop()
+    check_gate()
     check_plan()
     check_upload_fail_fast()
     asyncio.run(check_server())

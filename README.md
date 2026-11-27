@@ -220,6 +220,12 @@ about **$0.35**. The default machine dies after **60 minutes** or
 **$1.50**, whichever comes first. It also dies after **10 minutes** with
 nobody connected. `--minutes` can be at most 120.
 
+By default the model speaks more quietly (temperature 0.75, top 25 choices)
+and stays silent while you are talking, plus about half a second after you
+stop. The page has a small Sound panel if you want to change that without
+starting the machine again. `--temp`, `--top-k`, and `--hangover-ms` set
+the same numbers at launch.
+
 The model only remembers the last **4 minutes** of the conversation
 (3000 frames, 240 seconds). When that fills, the page says so and starts
 a fresh conversation. The old audio is not kept.

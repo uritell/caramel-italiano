@@ -3,7 +3,9 @@
 Each call is one 80 ms frame (1920 samples at 24 kHz). The person is the
 "other" speaker: their 8 Mimi codebooks are fed in. The model is the
 speaker being modelled: Model.step samples its own 8 codebooks (forced is
--2). Batch size is 1.
+-2) unless the person is talking. While they are, and for a short hangover
+after, those 8 codes are forced to a silence frame and the played audio is
+zeros. The person's codes still go in on the other side. Batch size is 1.
 
 Acoustic codebooks are one frame behind codebook 0, the same delay as
 generate.py. The first frame therefore returns no audio. The next frame
@@ -17,6 +19,7 @@ reset keeps the same tensors so the graph stays valid.
 from __future__ import annotations
 
 import inspect
+import math
 import time
 from dataclasses import dataclass
 
@@ -25,6 +28,11 @@ import torch
 
 SR = 24000
 FRAME = 1920  # 80 ms at 24 kHz. Mimi emits one frame of 8 codes per chunk.
+# Quieter than the old generate.py defaults (1.1 / 50), which talked over the person.
+DEFAULT_TEMP = 0.75
+DEFAULT_TOP_K = 25
+DEFAULT_VAD_RMS = 0.02
+DEFAULT_HANGOVER_MS = 500
 
 
 @dataclass
@@ -141,12 +149,41 @@ def decode_frame(mimi, codes: torch.Tensor, state: _CodecState) -> torch.Tensor:
     return audio[0, 0] if audio.dim() == 3 else audio.reshape(-1)
 
 
+def frame_rms(wave: torch.Tensor) -> float:
+    x = wave.detach().float().reshape(-1)
+    if x.numel() == 0:
+        return 0.0
+    return float(torch.sqrt((x * x).mean()))
+
+
+def hangover_frames(hangover_ms: int) -> int:
+    """500 ms is 7 frames, because each frame is 80 ms."""
+    if hangover_ms <= 0:
+        return 0
+    return max(1, math.ceil(hangover_ms / 80.0))
+
+
 class LiveLoop:
-    def __init__(self, model, mimi, temp: float = 1.1, top_k: int = 50):
+    def __init__(
+        self,
+        model,
+        mimi,
+        temp: float = DEFAULT_TEMP,
+        top_k: int = DEFAULT_TOP_K,
+        vad_rms: float = DEFAULT_VAD_RMS,
+        hangover_ms: int = DEFAULT_HANGOVER_MS,
+        gate: bool = True,
+    ):
         self.model = model
         self.mimi = mimi
-        self.temp = temp
-        self.top_k = top_k
+        self.temp = float(temp)
+        self.top_k = max(1, int(top_k))
+        self.vad_rms = float(vad_rms)
+        self.hangover_ms = int(hangover_ms)
+        self.hangover_n = hangover_frames(self.hangover_ms)
+        self.gate_enabled = bool(gate)
+        self._hang_left = 0
+        self._silence = None
         self.cfg = model.cfg
         self.device = _device_of(model)
         self.card = int(self.cfg.card)
@@ -168,6 +205,7 @@ class LiveLoop:
         self.prev_human_aligned = None
         self.prev_model_delayed = None
         self.frame_index = 0
+        self._hang_left = 0
         self.codec.clear()
 
     def _zero_state(self) -> None:
@@ -197,6 +235,54 @@ class LiveLoop:
             self.graph = None
         self._zero_state()
 
+    def set_sampling(self, temp=None, top_k=None, gate=None, vad_rms=None, hangover_ms=None) -> dict:
+        """Apply a live change from the page. A new temperature drops the CUDA graph."""
+        if temp is not None and float(temp) != self.temp:
+            self.temp = max(0.0, min(2.0, float(temp)))
+            self.graph = None
+        if top_k is not None and int(top_k) != self.top_k:
+            self.top_k = max(1, min(200, int(top_k)))
+            self.graph = None
+        if gate is not None:
+            self.gate_enabled = bool(gate)
+            if not self.gate_enabled:
+                self._hang_left = 0
+        if vad_rms is not None:
+            self.vad_rms = max(0.0, float(vad_rms))
+        if hangover_ms is not None:
+            self.hangover_ms = max(0, int(hangover_ms))
+            self.hangover_n = hangover_frames(self.hangover_ms)
+        return {
+            "temp": self.temp,
+            "top_k": self.top_k,
+            "gate": self.gate_enabled,
+            "vad_rms": self.vad_rms,
+            "hangover_ms": self.hangover_ms,
+        }
+
+    def _silence_codes(self) -> torch.Tensor:
+        """One frame of digital silence, encoded once on a throwaway codec state."""
+        if self._silence is not None:
+            return self._silence
+        try:
+            codes = encode_frame(self.mimi, torch.zeros(1, 1, FRAME, device=self.device), _CodecState())
+            self._silence = codes.to(device=self.device, dtype=torch.long).view(8).clamp(0, self.card - 1)
+        except Exception:  # noqa: BLE001
+            self._silence = torch.zeros(8, dtype=torch.long, device=self.device)
+        return self._silence
+
+    def _gate_open(self, rms: float) -> bool:
+        """True while the person is speaking and for the hangover after they stop."""
+        if not self.gate_enabled:
+            return False
+        if rms >= self.vad_rms:
+            self._hang_left = self.hangover_n
+            return True
+        if self._hang_left > 0:
+            self._hang_left -= 1
+            return True
+        return False
+
     def _step(self) -> torch.Tensor:
         if self.graph is None:
             return self.model.step(self.st, self.inp, self.forced, self.temp, self.top_k)
@@ -214,11 +300,18 @@ class LiveLoop:
         if self.frame_index >= self.context:
             self.reset()
             reset = True
+        rms = frame_rms(wave)
+        gated = self._gate_open(rms)
         aligned = encode_frame(self.mimi, wave, self.codec).to(self.device)
         human_delayed = delay_frame(aligned, self.prev_human_aligned, self.delays, self.card)
         # Previous delayed tokens: model on the left (the side step samples), person on the right.
+        # The person's codes stay on the right even while the gate mutes the model.
         self.inp[0, :8] = self.prev_model
         self.inp[0, 8:16] = self.prev_human
+        if gated:
+            self.forced[0].copy_(self._silence_codes())
+        else:
+            self.forced.fill_(-2)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -228,7 +321,9 @@ class LiveLoop:
         ms = (time.perf_counter() - t0) * 1e3
         ready = aligned_from_delayed(self.prev_model_delayed, out, self.delays, self.card)
         pcm = np.zeros(0, dtype=np.float32)
-        if ready is not None:
+        if ready is not None and gated:
+            pcm = np.zeros(FRAME, dtype=np.float32)
+        elif ready is not None:
             audio = decode_frame(self.mimi, ready, self.codec).detach().float().cpu().numpy().reshape(-1)
             pcm = np.ascontiguousarray(audio, dtype=np.float32)
         self.prev_model_delayed = out.detach().clone()
@@ -237,14 +332,15 @@ class LiveLoop:
         self.prev_human_aligned = aligned.detach().clone()
         self.frame_index += 1
         left = max(0.0, (self.context - self.frame_index) * 0.08 / 60.0)
-        status = (
-            "The 4 minute memory is full. Starting a fresh conversation."
-            if reset
-            else "Listening."
-        )
+        if reset:
+            status = "The 4 minute memory is full. Starting a fresh conversation."
+        elif gated:
+            status = "Waiting while you talk."
+        else:
+            status = "Listening."
         print(
             f"frame {self.frame_index} {ms:.2f} ms/frame "
-            f"minutes_left={left:.2f} reset={int(reset)}",
+            f"minutes_left={left:.2f} reset={int(reset)} gate={int(gated)}",
             flush=True,
         )
         return FrameResult(pcm, ms, self.frame_index, left, reset, status)
