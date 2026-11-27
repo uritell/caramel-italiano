@@ -42,12 +42,15 @@ def check_warmstart() -> None:
         names = [name for name, _, _ in cmds]
         if names != ["s2", "s3"]:
             raise SystemExit(f"warmstart stages: {names}")
-        blob = " ".join(" ".join(argv) for _, argv, _ in cmds)
-        for needle in ("--init-weights", "--boost-first", "--boost", "1e-4", "--save_best"):
-            if needle not in blob:
-                raise SystemExit(f"warmstart command missing {needle}")
+        stages.assert_warmstart_numbers(cmds)
         if "--resume" in " ".join(cmds[0][1]):
             raise SystemExit("stage 2 must load safetensors, not resume")
+        try:
+            stages.assert_full_numbers(cmds)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("the pilot assert accepted warmstart commands")
     finally:
         os.environ.pop("PILOT_CONFIG", None)
     print(f"warmstart ok: {est['seconds'] / 60:.1f} min, ${est['gpu_cents'] / 100:.2f} GPU")
@@ -313,6 +316,114 @@ def check_shell() -> None:
     print("bash -n ok; watchdog self-test passes under bash and fails under dash")
 
 
+def check_launch_dispatch() -> None:
+    """--launch must call launch(); the dry-run return must not swallow it."""
+    seen = {}
+    orig_launch, orig_dry = launch.launch, launch.dry_run
+
+    def fake_launch(*args, **kwargs):
+        seen["launch"] = args
+        return 0
+
+    def fake_dry(*args, **kwargs):
+        seen["dry"] = args
+        return 0
+
+    launch.launch = fake_launch
+    launch.dry_run = fake_dry
+    try:
+        rc = launch.main([
+            "--launch", "--config", "warmstart",
+            "--stores", "runpod/retrieved/mviebvzw3ht7hn/stores",
+        ])
+        if rc != 0 or "launch" not in seen or "dry" in seen:
+            raise SystemExit(f"--launch did not call launch(): rc={rc} keys={list(seen)}")
+        if seen["launch"][4] != "warmstart":
+            raise SystemExit(f"launch was not warmstart: {seen['launch'][4]}")
+        if not str(seen["launch"][5]).endswith("mviebvzw3ht7hn/stores"):
+            raise SystemExit(f"stores were not passed to launch(): {seen['launch'][5]}")
+        rc = launch.main(["--dry-run", "--config", "pilot"])
+        if rc != 0 or "dry" not in seen:
+            raise SystemExit("dry-run did not call dry_run()")
+    finally:
+        launch.launch = orig_launch
+        launch.dry_run = orig_dry
+        os.environ.pop("PILOT_CONFIG", None)
+    print("launch dispatch ok")
+
+
+def check_proxy_retry_and_pull() -> None:
+    """A proxy 502 is retried. A later stop still pulls before terminate."""
+    import io
+    import tempfile
+    import urllib.error
+
+    hits = {"n": 0}
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class OneShot(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits["n"] += 1
+            if hits["n"] < 3:
+                body = b"bad"
+                self.send_response(502)
+            else:
+                body = b"pulled"
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), OneShot)
+    port = httpd.server_address[1]
+    thread = __import__("threading").Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = launch._http_get(f"http://127.0.0.1:{port}/log", "tok", timeout=5, attempts=5, pause=lambda _s: None)
+    finally:
+        httpd.shutdown()
+    if body != b"pulled" or hits["n"] != 3:
+        raise SystemExit(f"502 was not retried: hits={hits['n']} body={body!r}")
+
+    calls = {"status": 0, "pull": 0, "term": 0}
+
+    def status(pod_id, key):
+        calls["status"] += 1
+        if calls["status"] == 1:
+            raise urllib.error.HTTPError("https://proxy", 502, "bad gateway", None, io.BytesIO(b"bad"))
+        return {"pod": {"id": pod_id, "desiredStatus": "RUNNING", "costPerHr": 4.39,
+                        "runtime": {"uptimeInSeconds": 5}}, "via": "test"}
+
+    def pull(*_a, **_k):
+        calls["pull"] += 1
+        return "proxy"
+
+    def term(*_a, **_k):
+        calls["term"] += 1
+        return {"via": "test"}
+
+    saved = (graphql_api.pod_status, graphql_api.terminate_pod, launch.pull_outputs,
+             launch.pull_server_answered, time.sleep)
+    graphql_api.pod_status = status
+    graphql_api.terminate_pod = term
+    launch.pull_outputs = pull
+    launch.pull_server_answered = lambda *_a, **_k: True
+    time.sleep = lambda _s: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = launch.follow("pod123", "k", "tok", int(time.time()), 439, Path(tmp), "",
+                               wall_s=0, cap_cents=300)
+    finally:
+        (graphql_api.pod_status, graphql_api.terminate_pod, launch.pull_outputs,
+         launch.pull_server_answered, time.sleep) = saved
+    if rc != 0 or calls["status"] < 2 or calls["pull"] < 1 or calls["term"] < 1:
+        raise SystemExit(f"follow did not retry then pull before terminate: rc={rc} {calls}")
+    print("proxy retry ok")
+
+
 def main() -> int:
     check_cost()
     check_option_a()
@@ -322,6 +433,8 @@ def main() -> int:
     check_watchdog_copies()
     check_reader()
     check_shell()
+    check_launch_dispatch()
+    check_proxy_retry_and_pull()
     print("self-check ok")
     return 0
 

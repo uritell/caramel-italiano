@@ -425,10 +425,29 @@ def proxy_base(pod_id: str) -> str:
     return f"https://{pod_id}-8080.proxy.runpod.net"
 
 
-def _http_get(url: str, token: str, timeout: int = 60) -> bytes:
-    req = urllib.request.Request(url, headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 5, pause=time.sleep) -> bytes:
+    """GET one pull-server URL. A proxy 5xx is retried. A 4xx is returned to the caller."""
+    delay = 1.0
+    last: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if not (500 <= exc.code < 600):
+                raise
+            last = exc
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            last = exc
+        if attempt + 1 == attempts:
+            break
+        print(f"proxy GET retry {attempt + 1}/{attempts}: {last}", flush=True)
+        pause(delay)
+        delay = min(delay * 2, 20)
+    if isinstance(last, urllib.error.HTTPError):
+        raise last
+    raise last if last is not None else RuntimeError(f"GET failed: {url}")
 
 
 def pull_server_answered(pod_id: str, token: str, timeout: int = 15) -> bool:
@@ -772,13 +791,27 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wa
             # A finished job writes DONE. Pull it, then terminate.
             if status == "RUNNING":
                 marker = out_dir / "DONE"
-                if not marker.exists():
-                    pull_outputs(current, out_dir, token, ssh_key)
+                try:
+                    if not marker.exists():
+                        pull_outputs(current, out_dir, token, ssh_key)
+                except urllib.error.HTTPError as exc:
+                    if 500 <= exc.code < 600:
+                        print(f"{_stamp()} pull proxy {exc.code}; will retry", flush=True)
+                        continue
+                    terminate(f"pull failed: HTTP {exc.code}")
+                    return 1
+                except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                    print(f"{_stamp()} pull retryable error: {exc}", flush=True)
+                    continue
                 if (out_dir / "DONE").exists():
                     terminate("pilot finished")
                     return 0
     except KeyboardInterrupt:
         terminate("interrupted")
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"{_stamp()} launcher failed: {exc}", flush=True)
+        terminate(f"launcher error: {exc}")
         return 1
 
 
@@ -865,7 +898,7 @@ def main(argv: list[str]) -> int:
         return 2
     if not args.launch:
         return dry_run(args.repo_url, args.repo_ref, args.config)
-        return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key, args.config, args.stores)
+    return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key, args.config, args.stores)
 
 
 if __name__ == "__main__":
