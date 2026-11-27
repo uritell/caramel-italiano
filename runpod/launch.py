@@ -11,17 +11,20 @@ only when that call fails. The cap terminates the pod (it does not stop it).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -293,6 +296,10 @@ def print_plan(body: dict, hourly_cents: int, wall_s: int | None = None, cap_cen
     print(f"       bill at the time cap would be {cost.format_usd(wall_cost)}")
     print(f"api:   {graphql_api.GRAPHQL_URL}")
     print("ops:   podFindAndDeployOnDemand, pod, podStop, podTerminate")
+    if include_checkpoints():
+        print("pull:  streamed to disk, including resume ckpt.pt")
+    else:
+        print("pull:  streamed to disk; resume ckpt.pt stays on the pod unless --include-checkpoints")
     print()
     print(stages.format_commands(stages.full_commands(
         "python", Path("tokenize/out/mono"), Path("tokenize/out/stereo"),
@@ -399,30 +406,91 @@ def _ssh_target(pod: dict) -> tuple[str, int, str] | None:
     return None
 
 
-def _pull_ssh(pod: dict, dest: Path, key_path: str) -> bool:
+def _pull_ssh(pod: dict, dest: Path, key_path: str, include_ckpt: bool | None = None) -> bool:
     target = _ssh_target(pod)
     if target is None or shutil.which("scp") is None:
         return False
     host, port, user = target
     dest.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "scp", "-r", "-P", str(port),
+    common = [
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=20",
     ]
     if key_path:
-        cmd += ["-i", key_path]
-    cmd += [f"{user}@{host}:/workspace/pilot-out/.", str(dest)]
-    print("pull via scp", " ".join(cmd[:6]), "...", flush=True)
-    proc = subprocess.run(cmd)
-    return proc.returncode == 0 and any(dest.iterdir())
+        common += ["-i", key_path]
+    if include_checkpoints(include_ckpt) or shutil.which("ssh") is None or shutil.which("tar") is None:
+        cmd = ["scp", "-r", "-P", str(port), *common, f"{user}@{host}:/workspace/pilot-out/.", str(dest)]
+        print("pull via scp", " ".join(cmd[:6]), "...", flush=True)
+        proc = subprocess.run(cmd)
+        return proc.returncode == 0 and any(dest.iterdir())
+    remote = "tar -C /workspace/pilot-out -cf - --exclude=ckpt.pt ."
+    cmd = ["ssh", "-p", str(port), *common, f"{user}@{host}", remote]
+    print("pull via ssh tar (skipping ckpt.pt)", flush=True)
+    remote_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    try:
+        extract = subprocess.run(["tar", "-C", str(dest), "-xf", "-"], stdin=remote_proc.stdout)
+    finally:
+        if remote_proc.stdout is not None:
+            remote_proc.stdout.close()
+        remote_proc.wait()
+    return extract.returncode == 0 and remote_proc.returncode == 0 and any(dest.iterdir())
 
 
 def proxy_base(pod_id: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", pod_id or ""):
         raise ValueError(f"pod id {pod_id!r} is not safe in a proxy hostname")
     return f"https://{pod_id}-8080.proxy.runpod.net"
+
+
+# One megabyte is enough to make progress and small enough that a pull cannot
+# hold a multi-gigabyte checkpoint in the launcher process.
+PULL_CHUNK_BYTES = 1 << 20
+
+
+def pull_sort_key(rel: str) -> tuple[int, str]:
+    """Export, best weights, samples, logs, then eval. Everything else after that."""
+    path = rel.replace("\\", "/").lstrip("./")
+    name = path.rsplit("/", 1)[-1]
+    if path.startswith("caramel-it/") or path.startswith("export/"):
+        rank = 0
+    elif name == "best.pt":
+        rank = 1
+    elif path.startswith("samples/"):
+        rank = 2
+    elif path.startswith("logs/") or name.endswith(".log"):
+        rank = 3
+    elif path == "eval.json" or path.startswith("eval/") or name.startswith("eval."):
+        rank = 4
+    else:
+        rank = 5
+    return (rank, path)
+
+
+def is_resume_ckpt(rel: str) -> bool:
+    """ckpt.pt is the optimizer resume file. best.pt is the weights we keep."""
+    name = rel.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return name == "ckpt.pt"
+
+
+def include_checkpoints(flag: bool | None = None) -> bool:
+    if flag is not None:
+        return flag
+    return os.environ.get("PILOT_INCLUDE_CKPT", "").lower() in {"1", "true", "yes"}
+
+
+def _proxy_flap(code: int, raw: bytes) -> bool:
+    if 500 <= code < 600:
+        return True
+    return code == 404 and not raw.strip()
+
+
+def _error_body(exc: urllib.error.HTTPError, limit: int = 4096) -> bytes:
+    try:
+        raw = exc.read(limit) if exc.fp is not None else b""
+    except Exception:  # noqa: BLE001
+        raw = b""
+    return raw or b""
 
 
 def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 8, pause=time.sleep) -> bytes:
@@ -481,9 +549,58 @@ def _ack(base: str, token: str) -> None:
             print(f"ack {method} failed: {exc}", flush=True)
 
 
-def _pull_http_base(base: str, dest: Path, token: str) -> bool:
+def _stream_to(
+    url: str, token: str, dest: Path, timeout: int = 300, attempts: int = 8,
+    pause=time.sleep, chunk_bytes: int = PULL_CHUNK_BYTES,
+) -> int:
+    """Write one file to disk in chunks. A proxy flap retries this same file."""
+    delay = 2.0
+    last: Exception | None = None
+    partial = dest.with_name(dest.name + ".partial")
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                expect = resp.headers.get("Content-Length")
+                written = 0
+                with partial.open("wb") as fh:
+                    while True:
+                        block = resp.read(chunk_bytes)
+                        if not block:
+                            break
+                        fh.write(block)
+                        written += len(block)
+                if expect is not None and written != int(expect):
+                    raise http.client.IncompleteRead(b"", int(expect) - written)
+                partial.replace(dest)
+                return written
+        except urllib.error.HTTPError as exc:
+            body = _error_body(exc)
+            if not _proxy_flap(exc.code, body):
+                partial.unlink(missing_ok=True)
+                raise
+            last = exc
+        except (TimeoutError, urllib.error.URLError, OSError, http.client.IncompleteRead) as exc:
+            last = exc
+        partial.unlink(missing_ok=True)
+        if attempt + 1 == attempts:
+            break
+        print(f"proxy GET retry {attempt + 1}/{attempts}: {last}", flush=True)
+        pause(delay)
+        delay = min(delay * 2, 60)
+    if isinstance(last, urllib.error.HTTPError):
+        raise last
+    raise last if last is not None else RuntimeError(f"GET failed: {url}")
+
+
+def _pull_http_base(
+    base: str, dest: Path, token: str, include_ckpt: bool | None = None,
+    chunk_bytes: int = PULL_CHUNK_BYTES, pause=time.sleep, attempts: int = 8,
+    on_file=None,
+) -> bool:
     try:
-        listing = json.loads(_http_get(base.rstrip("/") + "/", token))
+        listing = json.loads(_http_get(base.rstrip("/") + "/", token, pause=pause, attempts=attempts))
     except Exception as exc:  # noqa: BLE001
         print(f"HTTP list {base} failed: {exc}", flush=True)
         return False
@@ -491,7 +608,12 @@ def _pull_http_base(base: str, dest: Path, token: str) -> bool:
     if not files:
         return False
     dest.mkdir(parents=True, exist_ok=True)
-    for rel in files:
+    keep_ckpt = include_checkpoints(include_ckpt)
+    pulled = False
+    for rel in sorted(files, key=pull_sort_key):
+        if not keep_ckpt and is_resume_ckpt(rel):
+            print(f"skip {rel} (resume checkpoint; pass --include-checkpoints to copy it)", flush=True)
+            continue
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         size_hdr = None
@@ -506,20 +628,29 @@ def _pull_http_base(base: str, dest: Path, token: str) -> bool:
         except Exception:
             size_hdr = None
         if target.is_file() and size_hdr and target.stat().st_size == int(size_hdr):
+            pulled = True
+            if on_file is not None:
+                on_file(rel)
             continue
-        data = _http_get(base.rstrip("/") + "/" + rel, token, timeout=300)
-        target.write_bytes(data)
-        print(f"pulled {rel} ({len(data)} bytes)", flush=True)
-    _ack(base, token)
-    return True
+        nbytes = _stream_to(
+            base.rstrip("/") + "/" + rel, token, target,
+            pause=pause, attempts=attempts, chunk_bytes=chunk_bytes,
+        )
+        pulled = True
+        if on_file is not None:
+            on_file(rel)
+        print(f"pulled {rel} ({nbytes} bytes)", flush=True)
+    if pulled:
+        _ack(base, token)
+    return pulled
 
 
-def _pull_http(pod: dict, dest: Path, token: str) -> bool:
+def _pull_http(pod: dict, dest: Path, token: str, include_ckpt: bool | None = None) -> bool:
     found = _public_port(pod, 8080)
     if not found:
         return False
     ip, port = found
-    return _pull_http_base(f"http://{ip}:{port}", dest, token)
+    return _pull_http_base(f"http://{ip}:{port}", dest, token, include_ckpt=include_ckpt)
 
 
 def upload_stores_chunked(pod_id: str, token: str, src: Path, chunk_bytes: int = 32 * 1024 * 1024) -> None:
@@ -585,18 +716,19 @@ def upload_restore(pod_id: str, token: str, src: Path) -> None:
     print(f"uploaded {sent} files and marked READY", flush=True)
 
 
-def pull_outputs(pod: dict, dest: Path, token: str, key_path: str) -> str:
+def pull_outputs(pod: dict, dest: Path, token: str, key_path: str, include_ckpt: bool | None = None) -> str:
     """Proxy first. Direct ip:port is blocked from the launcher. SSH is last."""
     pod_id = str(pod.get("id") or "")
+    include = include_checkpoints(include_ckpt)
     if pod_id:
         try:
-            if _pull_http_base(proxy_base(pod_id), dest, token):
+            if _pull_http_base(proxy_base(pod_id), dest, token, include_ckpt=include):
                 return "proxy"
         except ValueError as exc:
             print(f"proxy url skipped: {exc}", flush=True)
-    if _pull_http(pod, dest, token):
+    if _pull_http(pod, dest, token, include_ckpt=include):
         return "http"
-    if _pull_ssh(pod, dest, key_path):
+    if _pull_ssh(pod, dest, key_path, include_ckpt=include):
         if pod_id:
             try:
                 _ack(proxy_base(pod_id), token)
@@ -604,6 +736,47 @@ def pull_outputs(pod: dict, dest: Path, token: str, key_path: str) -> str:
                 pass
         return "ssh"
     return ""
+
+
+@contextmanager
+def termination_guard(terminate):
+    """Run terminate on the way out, and on SIGTERM, unless it already ran.
+
+    SIGKILL cannot be caught. The in-pod watchdog covers that case.
+    """
+    state = {"phase": "open", "signal": None}
+
+    def once(reason: str) -> None:
+        if state["phase"] != "open":
+            return
+        state["phase"] = "stopping"
+        try:
+            terminate(reason)
+        finally:
+            state["phase"] = "done"
+
+    def handler(signum, _frame) -> None:
+        state["signal"] = signum
+        if state["phase"] == "open":
+            raise KeyboardInterrupt
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[sig] = signal.signal(sig, handler)
+        except (ValueError, OSError):
+            continue
+    try:
+        yield once
+    except KeyboardInterrupt:
+        why = "interrupted" if state["signal"] is None else f"signal {state['signal']}"
+        once(why)
+        raise
+    finally:
+        if state["phase"] == "open":
+            once("launcher exiting")
+        for sig, old in previous.items():
+            signal.signal(sig, old)
 
 
 def _hourly_from_pod(pod: dict, fallback: int) -> int:
@@ -700,7 +873,11 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wa
     cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
     if pod is None:
         pod = {"id": pod_id}
+    abandoned = {"v": False}
+
     def terminate(reason: str) -> None:
+        if abandoned["v"]:
+            return
         print(f"terminate ({reason})", flush=True)
         try:
             latest = graphql_api.pod_status(pod_id, api_key).get("pod") or pod
@@ -728,101 +905,103 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wa
         "out": str(out_dir),
     }
     (out_dir / "attach.json").write_text(json.dumps(attach, indent=2) + "\n")
-    try:
-        while True:
-            time.sleep(20)
-            try:
-                got = graphql_api.pod_status(pod_id, api_key)
-            except (graphql_api.ApiError, TimeoutError, OSError) as exc:
-                print(f"{_stamp()} status retryable error: {exc}", flush=True)
-                continue
-            current = got.get("pod") or {}
-            gone = not current
-            if gone:
+    with termination_guard(terminate) as stop:
+        try:
+            while True:
+                time.sleep(20)
                 try:
-                    ids = graphql_api.list_pod_ids(api_key)
+                    got = graphql_api.pod_status(pod_id, api_key)
                 except (graphql_api.ApiError, TimeoutError, OSError) as exc:
-                    print(f"{_stamp()} pod list failed: {exc}", flush=True)
+                    print(f"{_stamp()} status retryable error: {exc}", flush=True)
                     continue
-                if pod_id in ids:
-                    missing = 0
-                    print(f"{_stamp()} status was empty but myself.pods still has {pod_id}", flush=True)
-                    continue
-                missing += 1
-                print(f"{_stamp()} pod missing {missing}/3", flush=True)
-                if missing >= 3:
-                    print(f"{_stamp()} pod {pod_id} is gone from myself.pods; not calling terminate")
-                    return 2
-                continue
-            missing = 0
-            current.setdefault("id", pod_id)
-            elapsed = int(time.time()) - epoch
-            rate = _hourly_from_pod(current, hourly)
-            spent = cost.cost_cents(elapsed, rate)
-            reason = cost.stop_reason(elapsed, rate, wall_s, cap_cents)
-            status = _status_name(current)
-            uptime = _uptime_seconds(current)
-            if uptime is not None:
-                best_uptime = uptime if best_uptime is None else max(best_uptime, uptime)
-            if not proxy_up:
-                proxy_up = pull_server_answered(pod_id, token)
-            if proxy_up and (resume or stores_dir) and not uploaded:
-                try:
-                    if stores_dir:
-                        upload_stores_chunked(pod_id, token, Path(stores_dir))
-                    else:
-                        upload_restore(pod_id, token, Path(resume))
-                    uploaded = True
-                except (Exception, SystemExit) as exc:
-                    print(f"{_stamp()} upload aborted: {exc}", flush=True)
-                    terminate(f"upload failed: {exc}")
-                    return 1
-            print(
-                f"{_stamp()} [cost] {elapsed}s  {cost.format_usd(spent)}  "
-                f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  "
-                f"uptime {uptime if uptime is not None else 'none'}  "
-                f"proxy {'up' if proxy_up else 'down'}  via {got.get('via')}",
-                flush=True,
-            )
-            if reason:
-                terminate(reason)
-                return 0
-            if elapsed >= STARTUP_LIMIT_S and ((best_uptime is None or best_uptime <= 0) or not proxy_up):
-                why = []
-                if best_uptime is None or best_uptime <= 0:
-                    why.append(f"uptimeInSeconds still {best_uptime}")
-                if not proxy_up:
-                    why.append("pull server never answered on the proxy")
-                terminate("startup failed: " + "; ".join(why))
-                return 1
-            if status in {"TERMINATED", "EXITED", "ERROR"} or current.get("desiredStatus") in {"TERMINATED"}:
-                terminate(f"pod status {status}")
-                return 0 if status == "EXITED" else 1
-            # A finished job writes DONE. Pull it, then terminate.
-            if status == "RUNNING":
-                marker = out_dir / "DONE"
-                try:
-                    if not marker.exists():
-                        pull_outputs(current, out_dir, token, ssh_key)
-                except urllib.error.HTTPError as exc:
-                    if 500 <= exc.code < 600:
-                        print(f"{_stamp()} pull proxy {exc.code}; will retry", flush=True)
+                current = got.get("pod") or {}
+                gone = not current
+                if gone:
+                    try:
+                        ids = graphql_api.list_pod_ids(api_key)
+                    except (graphql_api.ApiError, TimeoutError, OSError) as exc:
+                        print(f"{_stamp()} pod list failed: {exc}", flush=True)
                         continue
-                    terminate(f"pull failed: HTTP {exc.code}")
-                    return 1
-                except (TimeoutError, urllib.error.URLError, OSError) as exc:
-                    print(f"{_stamp()} pull retryable error: {exc}", flush=True)
+                    if pod_id in ids:
+                        missing = 0
+                        print(f"{_stamp()} status was empty but myself.pods still has {pod_id}", flush=True)
+                        continue
+                    missing += 1
+                    print(f"{_stamp()} pod missing {missing}/3", flush=True)
+                    if missing >= 3:
+                        print(f"{_stamp()} pod {pod_id} is gone from myself.pods; not calling terminate")
+                        abandoned["v"] = True
+                        return 2
                     continue
-                if (out_dir / "DONE").exists():
-                    terminate("pilot finished")
+                missing = 0
+                current.setdefault("id", pod_id)
+                elapsed = int(time.time()) - epoch
+                rate = _hourly_from_pod(current, hourly)
+                spent = cost.cost_cents(elapsed, rate)
+                reason = cost.stop_reason(elapsed, rate, wall_s, cap_cents)
+                status = _status_name(current)
+                uptime = _uptime_seconds(current)
+                if uptime is not None:
+                    best_uptime = uptime if best_uptime is None else max(best_uptime, uptime)
+                if not proxy_up:
+                    proxy_up = pull_server_answered(pod_id, token)
+                if proxy_up and (resume or stores_dir) and not uploaded:
+                    try:
+                        if stores_dir:
+                            upload_stores_chunked(pod_id, token, Path(stores_dir))
+                        else:
+                            upload_restore(pod_id, token, Path(resume))
+                        uploaded = True
+                    except (Exception, SystemExit) as exc:
+                        print(f"{_stamp()} upload aborted: {exc}", flush=True)
+                        stop(f"upload failed: {exc}")
+                        return 1
+                print(
+                    f"{_stamp()} [cost] {elapsed}s  {cost.format_usd(spent)}  "
+                    f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  "
+                    f"uptime {uptime if uptime is not None else 'none'}  "
+                    f"proxy {'up' if proxy_up else 'down'}  via {got.get('via')}",
+                    flush=True,
+                )
+                if reason:
+                    stop(reason)
                     return 0
-    except KeyboardInterrupt:
-        terminate("interrupted")
-        return 1
-    except Exception as exc:  # noqa: BLE001
-        print(f"{_stamp()} launcher failed: {exc}", flush=True)
-        terminate(f"launcher error: {exc}")
-        return 1
+                if elapsed >= STARTUP_LIMIT_S and ((best_uptime is None or best_uptime <= 0) or not proxy_up):
+                    why = []
+                    if best_uptime is None or best_uptime <= 0:
+                        why.append(f"uptimeInSeconds still {best_uptime}")
+                    if not proxy_up:
+                        why.append("pull server never answered on the proxy")
+                    stop("startup failed: " + "; ".join(why))
+                    return 1
+                if status in {"TERMINATED", "EXITED", "ERROR"} or current.get("desiredStatus") in {"TERMINATED"}:
+                    stop(f"pod status {status}")
+                    return 0 if status == "EXITED" else 1
+                # A finished job writes DONE. Pull it, then terminate.
+                if status == "RUNNING":
+                    marker = out_dir / "DONE"
+                    try:
+                        if not marker.exists():
+                            pull_outputs(current, out_dir, token, ssh_key)
+                    except urllib.error.HTTPError as exc:
+                        if exc.code == 404 or 500 <= exc.code < 600:
+                            print(f"{_stamp()} pull proxy {exc.code}; will retry", flush=True)
+                            continue
+                        stop(f"pull failed: HTTP {exc.code}")
+                        return 1
+                    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                        print(f"{_stamp()} pull retryable error: {exc}", flush=True)
+                        continue
+                    if (out_dir / "DONE").exists():
+                        stop("pilot finished")
+                        return 0
+        except KeyboardInterrupt:
+            stop("interrupted")
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"{_stamp()} launcher failed: {exc}", flush=True)
+            stop(f"launcher error: {exc}")
+            return 1
 
 
 def rehearse_container_start() -> None:
@@ -899,8 +1078,14 @@ def main(argv: list[str]) -> int:
     p.add_argument("--ssh-key", default=os.environ.get("PILOT_SSH_KEY", ""))
     p.add_argument("--resume-from", type=Path, default=None,
                    help="upload stores/ and checkpoints/ from this directory once the new pod answers")
+    p.add_argument("--include-checkpoints", action="store_true",
+                   help="also pull resume ckpt.pt files. Off by default; they are the large optimizer state")
     args = p.parse_args(argv)
     os.environ["PILOT_CONFIG"] = args.config
+    if args.include_checkpoints:
+        os.environ["PILOT_INCLUDE_CKPT"] = "1"
+    else:
+        os.environ.pop("PILOT_INCLUDE_CKPT", None)
     if args.resume_from:
         os.environ["PILOT_RESUME_FROM"] = str(args.resume_from)
     if args.launch and args.dry_run:
