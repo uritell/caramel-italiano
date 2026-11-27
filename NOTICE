@@ -1,0 +1,62 @@
+Caramel Italiano
+Copyright 2026 the Caramel Italiano authors
+# TODO: replace the line above with the legal name of the person or
+# organisation that will own the GitHub repository, before the first release.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+==============================================================================
+Third-party software and model weights
+==============================================================================
+
+This project is an Italian-language retrain and supporting pipeline for
+caramel-1. It does not vendor the upstream training or generation code.
+Use the pinned checkout described in README.md.
+
+caramel (model, training recipe, and code)
+    Source: https://github.com/naklecha/caramel
+    Weights: https://huggingface.co/naklecha/caramel-1
+    (and the earlier public card https://huggingface.co/veajeaahvey/caramel-1)
+    Pinned commit: 84a9271d265841543287d4044d7ef80991a2b003
+    License: Apache License, Version 2.0
+    Copyright holders: as stated in that repository. The upstream LICENSE
+    file ships the standard Apache 2.0 text with an unfilled
+    "Copyright [yyyy] [name of copyright owner]" appendix; the Git author
+    of the pinned commit is Nishant Aklecha. Confirm the preferred
+    copyright line from the author before a public release.
+
+    This product includes software developed in naklecha/caramel,
+    licensed under the Apache License, Version 2.0.
+
+Mimi neural audio codec (weights)
+    Source: https://huggingface.co/kyutai/mimi
+    Code companion: https://github.com/kyutai-labs/moshi
+    Developed by: Kyutai
+    License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+        https://creativecommons.org/licenses/by/4.0/
+    The official model card does not publish a mandatory one-line
+    attribution string. Attribution below follows CC BY 4.0 (creator,
+    source URI, licence URI) plus the card's requested citation.
+
+    This project uses the Mimi neural audio codec developed by Kyutai,
+    available at https://huggingface.co/kyutai/mimi, licensed under
+    CC BY 4.0. Please cite:
+
+        Défossez, A., Mazaré, L., Orsini, M., Royer, A., Pérez, P.,
+        Jégou, H., Grave, E., and Zeghidour, N. (2024). Moshi: a
+        speech-text foundation model for real-time dialogue. Kyutai.
+        https://arxiv.org/abs/2410.00037
+
+Speech datasets used or planned for the pilot are not part of this
+source tree and are not relicensed by this NOTICE. See DATA_LICENSES.md
+for source URLs, licences, and attribution text for each corpus.

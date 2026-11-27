@@ -1,0 +1,3 @@
+[submodule "third_party/caramel"]
+	path = third_party/caramel
+	url = https://github.com/naklecha/caramel.git
