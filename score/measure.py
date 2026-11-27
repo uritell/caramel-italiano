@@ -171,6 +171,11 @@ def calibrate(prepared: list[dict], base: VadConfig) -> tuple[VadConfig, dict]:
             "Card figures are DataHive's own automatic labels."
         ),
     }
+    turn_durs: list[float] = []
+    for prep in prepared:
+        _stats, floor, _backchannels = analyse_prepared(prep, best["cfg"])
+        turn_durs.extend(float(region.duration_s) for region in floor)
+    best["pooled_full"]["floor_turn_duration_s"] = turn_durs
     return best["cfg"], {**summary, "_stats": best["stats_list"], "_pooled": best["pooled_full"]}
 
 
@@ -196,6 +201,7 @@ def build_config(cfg: VadConfig, calibration: dict) -> dict:
             "backchannels_per_min": pooled["backchannels_per_min"],
             "target_active_rms": pooled["target_active_rms"],
             "conversation_duration_s": pooled["conversation_duration_s"],
+            "floor_turn_duration_s": pooled.get("floor_turn_duration_s", []),
         },
     }
 

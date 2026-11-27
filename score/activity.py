@@ -347,6 +347,40 @@ def analyse_prepared(prep: dict, cfg: VadConfig) -> tuple[ConversationStats, lis
     return stats, floor, backchannels
 
 
+def mono_atoms(wave: np.ndarray, sr: int, cfg: VadConfig) -> list[tuple[np.ndarray, float]]:
+    """Split one channel into speech pieces at pauses this VAD still sees.
+
+    Each piece is trimmed to the speech mask, so file-edge silence is not
+    part of the piece. The second value is the silence, in seconds, that
+    follows the piece before the next one (0 after the last). Pauses
+    shorter than ``bridge_ms`` are filled first, which is the same rule
+    the conversation scorer uses, so a split here is a pause that scorer
+    would not glue back into one region.
+    """
+    wave = np.ascontiguousarray(wave, dtype=np.float32).reshape(-1)
+    if wave.size == 0:
+        return []
+    rms, hop = frame_rms(wave, sr, cfg.frame_ms, cfg.hop_ms)
+    mask, _threshold = activity_mask(rms, cfg)
+    bridge = int(round(cfg.bridge_ms / cfg.hop_ms))
+    min_frames = int(round(cfg.min_region_ms / cfg.hop_ms))
+    mask = smooth_mask(mask, bridge, min_frames)
+    spans = [(a, b) for val, a, b in _runs(mask) if val]
+    pieces = []
+    for i, (a, b) in enumerate(spans):
+        start = int(round(a * hop))
+        end = min(wave.size, max(int(round(b * hop)), start + 1))
+        audio = np.ascontiguousarray(wave[start:end], dtype=np.float32)
+        if audio.size < int(0.15 * sr):
+            continue
+        if i + 1 < len(spans):
+            pause = (spans[i + 1][0] - b) * hop / sr
+        else:
+            pause = 0.0
+        pieces.append((audio, float(max(0.0, pause))))
+    return pieces
+
+
 def analyse(left: np.ndarray, right: np.ndarray, sr: int, cfg: VadConfig) -> ConversationStats:
     prep = prepare(left, right, sr, cfg)
     stats, _, _ = analyse_prepared(prep, cfg)

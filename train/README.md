@@ -38,33 +38,125 @@ Run them from `third_party/caramel/`, and point `--data` / `--dev` /
 `--out` at this project's token stores and a gitignored `runs/`
 directory.
 
-## Pilot-sized step counts: TODO (do not invent)
+## Pilot-sized step counts
 
-`--steps 25000 / 47000` and `--stop_at 9000` belong to the full
-~11,000-hour English mix. They are almost certainly too large for a
-few-hundred-hour Italian pilot and would blow the $50 cap if copied
-blindly.
+These keep the same passes as the published recipe. They are not the
+English step counts scaled by a guess. One training frame is one Mimi
+frame, 12.5 per second of timeline, so an hour is
 
-Before any rental, measure:
+```text
+12.5 × 3600 = 45,000 frames
+```
 
-- token hours actually written to `tokenize/out/mono` and `.../stereo`
-- frames per second on the chosen GPU (upstream quotes up to ~145.6k
-  frames/s on one H100 with their kernels)
-- tokenization time, which the paper does not publish
+Upstream's batch is `--fpb 24000` frames per GPU. The published
+throughput used below is 145,600 frames/s on one H100. GPU-hours are
+`frames / 145600 / 3600`. Wall-clock on two GPUs assumes that rate on
+each GPU. The published English run lands within about 10% of this
+arithmetic, so it is a peak-rate estimate, not a measurement on our data.
 
-A CPU measurement from the smoke run (no GPU, 27 Nov 2026) is in
-`score/comparison.md`. Short clips encoded at about 0.028× real time
-(roughly 36× realtime) on this 4-vCPU box, so the 275 h already
-downloaded would take on the order of 8 CPU-hours. Long stereo files
-have to be chunked and ran at about 0.077× real time per channel.
-That is not a GPU quote. Pilot `--steps` are still unset.
+### Hours the steps are sized to
 
-Then set `--steps`, `--stop_at`, `--warmup`, and `--sched_start` so
-that the three stages stay inside the remaining budget (on-demand
-prices checked 27 Nov 2026, USD before tax: roughly $1.73/h Vast.ai
-verified H100 offer, $4.39/h RunPod, $4.89/h Lambda). Keep a held-out
-Italian stereo store on `--dev`. Write the chosen numbers here when
-they exist; do not fill them in by guesswork.
+Measured file hours, with the usual holdouts taken out:
+
+| Pool | Hours | What is in it |
+|---|---:|---|
+| Mono train | 257.923 | MLS train 247.378 + FLEURS train 8.998 + FLEURS dev 1.547 |
+| Held out of mono | 14.0 | MLS dev 5.176, MLS test 5.273, FLEURS test 3.521 |
+| Real stereo train | 2.929 | DataHive 3.051 minus `it_000002` (440.8 s), the smoke `--dev` file |
+| Synthetic stereo | 235.71 | see below |
+
+Synthetic stereo is not the 1 hour timing smoke. It is the timeline you
+get by running every mono training clip through the synthesizer once.
+On 80 MLS train clips, the median fraction that is speech after the same
+VAD is 0.8686. On the rebuilt 1 hour synthetic set, channel activity
+(both-talking + exactly-one) is 0.9504. So
+
+```text
+235.71 h = 257.923 × 0.8686 / 0.9504
+stereo train = 235.71 + 2.929 = 238.64 h
+```
+
+The same recordings are heard as monologue in stage 1 and again inside
+the synthetic dialogues. That is the pilot. It is not a second 258 hours
+of new speakers.
+
+### Passes, then steps
+
+Stage 1 is 0.83 passes of the mono pool, one GPU, as published:
+
+```text
+frames = 0.83 × 257.923 × 45,000 = 9,633,424
+steps  = 9,633,424 / 24,000 = 401.4  →  401 steps
+check  = 401 × 24,000 / 45,000 / 257.923 = 0.829 passes
+```
+
+Stage 2 is 2.4 passes of the stereo pool, and 80% of frames are stereo
+(`--weights 0.8 0.2`), on 2 GPUs:
+
+```text
+frames = 2.4 × 238.64 × 45,000 / 0.8 = 32,216,400
+steps  = 32,216,400 / (24,000 × 2) = 671.2  →  671 steps
+check  = 0.8 × 671 × 48,000 / 45,000 / 238.64 = 2.40 passes
+```
+
+Stage 3 adds the rest of the published 5.65 stereo passes, so
+5.65 − 2.40 = 3.25 more passes, same weights, 2 GPUs:
+
+```text
+frames = 3.25 × 238.64 × 45,000 / 0.8 = 43,626,375
+steps  = 43,626,375 / 48,000 = 908.9  →  909 steps
+check  = 0.8 × 909 × 48,000 / 45,000 / 238.64 = 3.25 passes
+cumulative stereo passes = 2.40 + 3.25 = 5.65
+```
+
+Mono is also drawn for the 20% of stage 2 and stage 3. That is another
+0.55 then 0.75 passes, so mono is seen about 0.83 + 0.55 + 0.75 = 2.14
+times. Upstream's mono pool is heard about 2.2 times for the same reason.
+
+The shared stage-1/2 schedule is `401 + 671 = 1072` steps. Stage 3 runs
+to `1072 + 909 = 1981`.
+
+Published warmups are 50 steps and, in stage 3, 200 steps. Those are
+0.6% of the English stage-1 length and 0.9% of the English stage-3
+length. The same fractions of these runs are 2 steps and 8 steps.
+Using 50 and 200 here would spend most of stage 1 warming up.
+
+```bash
+# from third_party/caramel/, paths pointed at this repo's stores
+python train.py --data <mono> --steps 1072 --stop_at 401 --warmup 2 --out runs/s1
+torchrun --nproc_per_node 2 train.py --data <stereo> <mono> --weights 0.8 0.2 \
+    --steps 1072 --resume runs/s1/ckpt.pt --out runs/s2
+torchrun --nproc_per_node 2 train.py --data <stereo> <mono> --weights 0.8 0.2 \
+    --steps 1981 --resume runs/s2/ckpt.pt --sched_start 1072 --warmup 8 --lr 1.5e-4 \
+    --dev <held-out DataHive store> --eval_every 100 --patience 2 --save_best --out runs/s3
+```
+
+`<stereo>` has to be the full synthetic build plus the real calls, not
+the 1 hour timing smoke. `<dev>` is a real stereo store held out of that
+mix. `it_000002` is only 7.3 minutes; a longer held-out call would be a
+sturdier dev set and would shrink the 2.929 h figure a little.
+
+### H100 time and money
+
+```text
+frames = 401×24,000 + 671×48,000 + 909×48,000
+       = 9,624,000 + 32,208,000 + 43,632,000
+       = 85,464,000
+GPU-hours = 85,464,000 / 145,600 / 3,600 = 0.163
+```
+
+At the peak rate that is 1.1 min on one H100 for stage 1, then 1.8 min
+and 2.5 min of wall-clock on two H100s. Prices already written down on
+27 Nov 2026, USD before tax, times 0.163 h: about $0.28 (Vast.ai
+$1.73/h), $0.72 (RunPod $4.39/h), $0.80 (Lambda $4.89/h). Even at twice
+the peak estimate this is a few dollars, inside the $50 cap. It is still
+an estimate from the published frame rate, not a timed run, and nothing
+here rents a GPU.
+
+Tokenizing the 275 h already downloaded is a separate CPU cost, about
+8 hours on the smoke machine (`score/comparison.md`). The pilot stores
+from that smoke are a 10 minute mono slice and about an hour of stereo,
+not the pools above.
 
 Other `train.py` flags that matter, with their defaults: `--fpb 24000`
 (frames per batch per GPU), `--lr 3e-4`, `--warmup 50`, `--wd 0.1`,

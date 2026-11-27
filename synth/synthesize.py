@@ -2,13 +2,17 @@
 """Build synthetic two-track Italian conversations from MLS utterances.
 
 Each conversation puts one MLS speaker on the left and a different MLS
-speaker on the right. Turns alternate. The gap before the next turn is
-drawn from the empirical DataHive gap list (negative gaps are overlaps).
-Backchannels, when the measurement found any, are short slices of the
-listener's unused audio: duration and position along the other person's
-turn are drawn from the measured lists, and the count is Poisson with
-the measured rate per minute. Slices start and end near low energy so
-the cut is not in the middle of a loud frame. The slice is still read
+speaker on the right. MLS publishes clip boundaries, not word or pause
+alignments, so each clip is split with the same energy VAD used to score
+DataHive. Pieces are trimmed to the speech mask (MLS files carry several
+hundred milliseconds of silence at each end, which was being added on
+top of the sampled gap) and packed, pauses included, toward a duration
+drawn from the measured DataHive floor-turn lengths. Turns alternate.
+The gap before the next turn is drawn from the empirical DataHive gap
+list (negative gaps are overlaps). Backchannels, when the measurement
+found any, are short slices of the listener's unused audio, placed in a
+silent stretch of that channel during the other person's turn. Duration
+and position are drawn from the measured lists. The slice is still read
 speech, not a real "mhmm".
 
 FLEURS is not used here. Its public files have a gender and no speaker
@@ -30,7 +34,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "data"))
+sys.path.insert(0, str(ROOT / "score"))
 
+from activity import VadConfig, mono_atoms  # noqa: E402
 from audio import TARGET_SR, read_audio, resample_mono_like_generate  # noqa: E402
 from sources import SOURCES  # noqa: E402
 
@@ -66,6 +72,55 @@ def _load_clip(raw: Path, row: dict, target_rms: float) -> np.ndarray:
     mono = audio.mean(axis=1) if audio.shape[1] > 1 else audio[:, 0]
     y = resample_mono_like_generate(mono, sr, SR)
     return _match_rms(y, target_rms)
+
+
+def _pack_turn(queue: list[tuple[np.ndarray, float]], target_s: float, rng: np.random.Generator) -> np.ndarray | None:
+    """Pack pause-separated pieces toward ``target_s``.
+
+    The pause that originally followed a piece is kept between pieces, so
+    the scorer still hears one turn when that pause is inside its
+    intra-turn limit. A piece is only added when it moves the duration
+    closer to the target. The first piece is always kept: if there is no
+    pause inside it, there is nowhere natural to cut.
+    """
+    if not queue:
+        return None
+
+    def rendered(parts: list[np.ndarray], pauses: list[float]) -> tuple[np.ndarray, float]:
+        chunks: list[np.ndarray] = []
+        total = 0.0
+        for i, part in enumerate(parts):
+            chunks.append(part)
+            total += part.size / SR
+            if i < len(pauses):
+                n = int(round(pauses[i] * SR))
+                if n > 0:
+                    chunks.append(np.zeros(n, dtype=np.float32))
+                    total += n / SR
+        return np.concatenate(chunks), total
+
+    audio, pause_after = queue.pop(0)
+    parts = [audio]
+    between: list[float] = []
+    pending = pause_after
+    best, best_dur = rendered(parts, between)
+    # Pieces are a few seconds long, so "add only when it gets closer"
+    # undershoots the long DataHive turns and "add while still under"
+    # overshoots the short ones. While the turn is short of the target by
+    # a whole piece, add it. When the shortfall is only a fraction of the
+    # next piece, add it with that probability, so the average length
+    # tracks the sampled duration.
+    while queue and best_dur < target_s:
+        atom_s = queue[0][0].size / SR
+        shortfall = target_s - best_dur
+        if shortfall < atom_s and float(rng.random()) >= shortfall / max(atom_s, 1e-6):
+            break
+        nxt, nxt_pause = queue.pop(0)
+        parts.append(nxt)
+        between.append(pending)
+        pending = nxt_pause
+        best, best_dur = rendered(parts, between)
+    return best
 
 
 def _take(rows: list[dict], raw: Path, seconds: float, target_rms: float):
@@ -136,14 +191,88 @@ def _place(buffer: np.ndarray, start: int, clip: np.ndarray) -> tuple[np.ndarray
     return buffer, start, end, clamped
 
 
+def _busy_mask(buffer: np.ndarray, margin_s: float) -> np.ndarray:
+    """True where this channel is speech, or within ``margin_s`` of speech."""
+    energy = np.abs(buffer) > 1e-4
+    margin = int(round(margin_s * SR))
+    if margin <= 0 or not np.any(energy):
+        return energy
+    as_int = energy.astype(np.int32)
+    cumulative = np.empty(as_int.size + 1, dtype=np.int32)
+    cumulative[0] = 0
+    np.cumsum(as_int, out=cumulative[1:])
+    idx = np.arange(as_int.size)
+    hi = np.minimum(as_int.size, idx + margin + 1)
+    lo = np.maximum(0, idx - margin)
+    return (cumulative[hi] - cumulative[lo]) > 0
+
+
+def _place_backchannel(
+    buffer: np.ndarray,
+    busy: np.ndarray,
+    start_s: float,
+    end_s: float,
+    snippet: np.ndarray,
+    margin_s: float,
+) -> tuple[int, int] | None:
+    """Put ``snippet`` in silence during the other person's turn.
+
+    ``busy`` is speech on this channel dilated by the scorer's intra-turn
+    pause. A snippet placed inside that margin is merged into the
+    neighbouring turn and is not counted as a backchannel. ``busy`` is
+    updated to cover the snippet just written.
+    """
+    start_i = max(0, int(round(start_s * SR)))
+    end_i = min(buffer.size, int(round(end_s * SR)))
+    if end_i - start_i < int(0.08 * SR):
+        return None
+    silent = ~busy[start_i:end_i]
+    if not np.any(silent):
+        return None
+    # Runs of silence inside the turn, as absolute sample indices.
+    if silent.size == 1:
+        changes = np.array([], dtype=np.int64)
+    else:
+        changes = np.flatnonzero(silent[1:] != silent[:-1]) + 1
+    bounds = np.concatenate((np.array([0], dtype=np.int64), changes, np.array([silent.size], dtype=np.int64)))
+    runs = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if silent[int(a)]:
+            runs.append((start_i + int(a), start_i + int(b)))
+    prefer = min(max(start_i, 0), end_i - 1)
+    chosen = None
+    for run_s, run_e in runs:
+        if run_s <= prefer < run_e:
+            chosen = (run_s, run_e)
+            break
+    if chosen is None:
+        chosen = max(runs, key=lambda run: run[1] - run[0])
+    run_s, run_e = chosen
+    room = run_e - run_s
+    if room < int(0.08 * SR):
+        return None
+    piece = snippet[:room]
+    # Sit the piece at the preferred start when that falls inside the run.
+    at = prefer if run_s <= prefer < run_e else run_s
+    if at + piece.size > run_e:
+        at = run_e - piece.size
+    buffer[at : at + piece.size] += piece
+    margin = int(round(margin_s * SR))
+    lo = max(0, at - margin)
+    hi = min(busy.size, at + piece.size + margin)
+    busy[lo:hi] = True
+    return at, at + piece.size
+
+
 def _build_one(
-    clips_a: list[np.ndarray],
-    clips_b: list[np.ndarray],
+    turns_a: list[np.ndarray],
+    turns_b: list[np.ndarray],
     reservoir_a: np.ndarray,
     reservoir_b: np.ndarray,
     empirical: dict,
     rng: np.random.Generator,
     target_s: float,
+    margin_s: float,
 ) -> dict:
     gaps = np.asarray(empirical["gap_ms"], dtype=np.float64)
     if gaps.size == 0:
@@ -157,11 +286,12 @@ def _build_one(
     left = np.zeros(length, np.float32)
     right = np.zeros(length, np.float32)
     buffers = [left, right]
-    pools = [clips_a, clips_b]
+    pools = [turns_a, turns_b]
     index = [0, 0]
     side = 0
     t = 0.0
     turns = []
+    applied_gaps_ms: list[float] = []
     n_clamped = 0
     while t < target_s and index[0] < len(pools[0]) and index[1] < len(pools[1]):
         clip = pools[side][index[side]]
@@ -184,9 +314,10 @@ def _build_one(
             }
         )
         gap_s = float(gaps[int(rng.integers(0, gaps.size))]) / 1000.0
+        applied_gaps_ms.append(gap_s * 1000.0)
         t = end_s + gap_s
         side = 1 - side
-        if len(turns) > 4000:
+        if len(turns) > 8000:
             break
 
     # Trim to the last sample either channel used, but not past the target
@@ -218,24 +349,28 @@ def _build_one(
         else:
             weights /= weights.sum()
         reservoirs = [reservoir_a, reservoir_b]
+        busy = [_busy_mask(buffers[0], margin_s), _busy_mask(buffers[1], margin_s)]
         for _ in range(n_bc):
             turn = turns[int(rng.choice(len(turns), p=weights))]
             listener = 0 if turn["side"] == "right" else 1
             dur_s = float(bc_durations[int(rng.integers(0, bc_durations.size))]) / 1000.0
-            if dur_s < 0.05 or dur_s > max(0.05, turn["end_s"] - turn["start_s"]):
+            if dur_s < 0.05:
                 continue
             rel = float(bc_pos[int(rng.integers(0, bc_pos.size))])
-            room = (turn["end_s"] - turn["start_s"]) - dur_s
-            start_s = turn["start_s"] + rel * max(0.0, room)
+            room = max(0.0, (turn["end_s"] - turn["start_s"]) - dur_s)
+            start_s = turn["start_s"] + rel * room
             n = int(round(dur_s * SR))
             snippet = _slice_low_energy(reservoirs[listener], n, rng)
-            start_i = int(round(start_s * SR))
-            end_i = start_i + snippet.size
-            if end_i > buffers[listener].size:
+            placed = _place_backchannel(
+                buffers[listener], busy[listener], start_s, turn["end_s"], snippet, margin_s
+            )
+            if placed is None:
+                placed = _place_backchannel(
+                    buffers[listener], busy[listener], turn["start_s"], turn["end_s"], snippet, margin_s
+                )
+            if placed is None:
                 continue
-            if float(np.max(np.abs(buffers[listener][start_i:end_i]))) > 1e-4:
-                continue
-            buffers[listener][start_i:end_i] += snippet
+            start_i, end_i = placed
             backchannels.append(
                 {
                     "kind": "backchannel",
@@ -266,6 +401,8 @@ def _build_one(
         "n_gap_clamps": n_clamped,
         "duration_s": used / SR,
         "backchannels_drawn": use_bc,
+        "applied_gap_median_ms": float(np.median(applied_gaps_ms)) if applied_gaps_ms else float("nan"),
+        "placed_turn_median_s": float(np.median([ev["end_s"] - ev["start_s"] for ev in turns])) if turns else float("nan"),
     }
 
 
@@ -324,6 +461,11 @@ def main() -> int:
     args = p.parse_args()
     document = json.loads(args.config.read_text(encoding="utf-8"))
     empirical = document["empirical"]
+    cfg = VadConfig(**document["vad"])
+    turn_durs = np.asarray(empirical.get("floor_turn_duration_s") or [], dtype=np.float64)
+    if turn_durs.size == 0:
+        print("timing config has no floor_turn_duration_s; run score/measure.py", file=sys.stderr)
+        return 1
     target_rms = float(empirical.get("target_active_rms") or 0.0)
     lengths = _plan_lengths(empirical, args.hours, args.conversation_seconds)
     ranked = _speakers(_load_manifest(args.manifest))
@@ -339,8 +481,9 @@ def main() -> int:
     pair_i = 0
     licence = SOURCES["mls_it"]
     for n, target_s in enumerate(lengths):
-        # Each speaker needs a bit over half the timeline, plus a reservoir.
-        need = target_s * 0.65 + 20.0
+        # File duration, not speech. Edge silence is trimmed later, so ask
+        # for more file time than the speech we expect to place.
+        need = target_s * 0.9 + 30.0
         chosen = None
         for _try in range(len(ranked)):
             a_id, a_rows = ranked[(pair_i) % len(ranked)]
@@ -358,8 +501,39 @@ def main() -> int:
             break
         a_id, a_rows, b_id, b_rows = chosen
         print(f"conversation {n:03d}: speakers {a_id} / {b_id}, target {target_s:.0f}s", flush=True)
-        a_turn, a_used, _, a_consumed = _take(a_rows[cursor[a_id] :], args.raw, target_s * 0.7, target_rms)
-        b_turn, b_used, _, b_consumed = _take(b_rows[cursor[b_id] :], args.raw, target_s * 0.7, target_rms)
+
+        def speaker_turns(rows: list[dict]) -> tuple[list[np.ndarray], list[dict], int, float]:
+            # One queue across clips so a long DataHive turn (the distribution
+            # reaches past 13 s) can be packed from more than one utterance.
+            # MLS segments are not word-aligned; the only pauses we trust are
+            # the energy pauses inside and the boundary between clips.
+            queue: list[tuple[np.ndarray, float]] = []
+            used: list[dict] = []
+            consumed = 0
+            for row in rows:
+                consumed += 1
+                clip = _load_clip(args.raw, row, target_rms)
+                atoms = mono_atoms(clip, SR, cfg)
+                if not atoms:
+                    continue
+                queue.extend(atoms)
+                used.append(row)
+                queued = sum(len(audio) for audio, _pause in queue) / SR
+                if queued >= target_s * 0.7:
+                    break
+            made: list[np.ndarray] = []
+            speech = 0.0
+            while queue and speech < target_s * 0.6:
+                target = float(turn_durs[int(rng.integers(0, turn_durs.size))])
+                turn = _pack_turn(queue, target, rng)
+                if turn is None or turn.size < int(0.15 * SR):
+                    break
+                made.append(turn)
+                speech += turn.size / SR
+            return made, used, consumed, speech
+
+        a_turns, a_used, a_consumed, _a_speech = speaker_turns(a_rows[cursor[a_id] :])
+        b_turns, b_used, b_consumed, _b_speech = speaker_turns(b_rows[cursor[b_id] :])
         cursor[a_id] += a_consumed
         cursor[b_id] += b_consumed
         a_res_clips, a_res_used, _, a_res_n = _take(a_rows[cursor[a_id] :], args.raw, 40.0, target_rms)
@@ -368,10 +542,13 @@ def main() -> int:
         cursor[b_id] += b_res_n
         reservoir_a = np.concatenate(a_res_clips) if a_res_clips else np.zeros(0, np.float32)
         reservoir_b = np.concatenate(b_res_clips) if b_res_clips else np.zeros(0, np.float32)
-        if len(a_turn) < 2 or len(b_turn) < 2:
-            print(f"skip conversation {n}: not enough clips", flush=True)
+        if len(a_turns) < 4 or len(b_turns) < 4:
+            print(f"skip conversation {n}: not enough pause-split turns", flush=True)
             continue
-        built = _build_one(a_turn, b_turn, reservoir_a, reservoir_b, empirical, rng, target_s)
+        built = _build_one(
+            a_turns, b_turns, reservoir_a, reservoir_b, empirical, rng, target_s, cfg.intra_turn_pause_ms / 1000.0
+        )
+        source_s = sum(float(r["duration_s"]) for r in a_used + b_used + a_res_used + b_res_used)
         import soundfile as sf
 
         wav_path = conv_dir / f"conv_{n:03d}.wav"
@@ -395,6 +572,9 @@ def main() -> int:
             "n_turns": built["n_turns"],
             "n_backchannels": built["n_backchannels"],
             "n_gap_clamps": built["n_gap_clamps"],
+            "applied_gap_median_ms": built["applied_gap_median_ms"],
+            "placed_turn_median_s": built["placed_turn_median_s"],
+            "source_duration_s": source_s,
             "target_s": target_s,
             "timing_config": str(args.config),
             "seed": args.seed,
@@ -406,8 +586,10 @@ def main() -> int:
         manifest_rows.append({k: v for k, v in side.items() if k not in {"events", "clips_left", "clips_right"}})
         print(
             f"  wrote {wav_path.name}: {built['duration_s']:.1f}s, "
-            f"{built['n_turns']} turns, {built['n_backchannels']} backchannels, "
-            f"{built['n_gap_clamps']} gap clamps",
+            f"{built['n_turns']} turns, median turn {built['placed_turn_median_s']:.2f}s, "
+            f"applied gap median {built['applied_gap_median_ms']:.0f} ms, "
+            f"{built['n_backchannels']} backchannels, "
+            f"{built['n_gap_clamps']} gap clamps, source {source_s:.0f}s",
             flush=True,
         )
     man_path = args.out / "manifest.jsonl"
