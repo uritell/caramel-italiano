@@ -1,8 +1,8 @@
 #!/bin/bash
-# Container command. Replaces the image's /start.sh, so this file starts sshd
-# itself, arms the cap, clones the repo, then runs pod_run.sh.
-# The watchdog body below the exit is not executed here. bootstrap copies it
-# out and runs it as its own process. Keep it identical to runpod/watchdog.sh.
+# Fetched from the public repo and started under nohup. /start.sh stays PID 1
+# (sshd, the HTTP proxy, sleep infinity). This process clones the repo and
+# runs pod_run.sh. The watchdog body below the exit is copied out and run
+# as its own process. Keep it identical to runpod/watchdog.sh.
 set -u
 mkdir -p /workspace/pilot-out/logs /workspace/work
 echo "bootstrap $(date -u +%FT%TZ)" | tee -a /workspace/pilot-out/logs/bootstrap.log

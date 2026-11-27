@@ -11,16 +11,18 @@ only when that call fails. The cap terminates the pod (it does not stop it).
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
+import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cost
@@ -32,16 +34,74 @@ ROOT = HERE.parent
 IMAGE = "runpod/pytorch:2.2.0-cu1281-torch291-ubuntu2404"
 GPU_ID = "NVIDIA H100 80GB HBM3"
 REPO_URL_DEFAULT = "https://github.com/uritell/caramel-italiano.git"
+# Image pull plus a crash loop must not burn the whole cap. Measured failure
+# on pod umpal4do5pop5k: uptime stayed <= 0 for 10 minutes.
+STARTUP_LIMIT_S = 12 * 60
+# One env value. RunPod rejects oversized create bodies (about 100 KB).
+# The old base64 bootstrap was 7608 bytes; it is no longer sent.
+ENV_VALUE_LIMIT = 4096
 
 
-def _read_bootstrap() -> str:
-    return (HERE / "bootstrap.sh").read_text(encoding="utf-8")
+def github_slug(repo_url: str) -> str:
+    url = repo_url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    marker = "github.com/"
+    if marker not in url:
+        raise ValueError(f"bootstrap is fetched from GitHub, not from {repo_url}")
+    return url.split(marker, 1)[1]
+
+
+def bootstrap_raw_url(repo_url: str, ref: str) -> str:
+    """Public raw URL. A ref with a slash uses refs/heads so the path is unambiguous."""
+    slug = github_slug(repo_url)
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", ref):
+        raise ValueError(f"ref {ref!r} is not safe to put in a URL")
+    if "/" in ref:
+        return f"https://raw.githubusercontent.com/{slug}/refs/heads/{ref}/runpod/bootstrap.sh"
+    return f"https://raw.githubusercontent.com/{slug}/{ref}/runpod/bootstrap.sh"
+
+
+def container_script(raw_url: str) -> str:
+    """One bash -c script. /start.sh stays PID 1; the job is a child.
+
+    RunPod shlex-splits a bare dockerArgs string and execs it. A pipe or
+    here-string never reaches a shell. This script is a single argv element.
+    """
+    if "'" in raw_url or any(ch in raw_url for ch in "\n\r"):
+        raise ValueError("bootstrap URL must be a single shell word")
+    return (
+        "mkdir -p /workspace/pilot-out/logs\n"
+        f"if curl -fsSL --retry 5 --retry-delay 2 -o /tmp/pilot-bootstrap.sh '{raw_url}'; then\n"
+        "  nohup bash /tmp/pilot-bootstrap.sh >>/workspace/pilot-out/logs/job.log 2>&1 &\n"
+        "else\n"
+        "  echo bootstrap-download-failed >>/workspace/pilot-out/logs/job.log\n"
+        "fi\n"
+        "exec /start.sh\n"
+    )
+
+
+def docker_args_json(script: str) -> str:
+    """Shape RunPod keeps as arrays. A bare string would be shlex-split."""
+    return json.dumps(
+        {"entrypoint": ["/bin/bash", "-c"], "cmd": [script]},
+        separators=(",", ":"),
+    )
+
+
+def decode_docker_args(raw: str) -> tuple[list[str], list[str]]:
+    """Match RunPod: JSON entrypoint/cmd is used as-is; anything else is shlex-split."""
+    text = raw.strip()
+    if text.startswith("{"):
+        obj = json.loads(text)
+        entry = list(obj.get("entrypoint") or [])
+        cmd = list(obj.get("cmd") or [])
+        return entry, cmd
+    return [], shlex.split(text)
 
 
 def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> list[dict]:
-    bootstrap = base64.b64encode(_read_bootstrap().encode()).decode()
     env = {
-        "PILOT_BOOTSTRAP_B64": bootstrap,
         "PILOT_BILLING_EPOCH": str(billing_epoch),
         "PILOT_MAX_SECONDS": str(cost.MAX_WALL_S),
         "PILOT_MAX_USD_CENTS": str(cost.MAX_USD_CENTS),
@@ -59,16 +119,7 @@ def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, 
     key = os.environ.get("RUNPOD_API_KEY", "")
     if key:
         env["RUNPOD_API_KEY"] = key
-    gh = os.environ.get("GITHUB_TOKEN", "")
-    if gh:
-        env["GITHUB_TOKEN"] = gh
     return [{"key": k, "value": v} for k, v in env.items()]
-
-
-def docker_command() -> str:
-    # One shell command. The script itself is in PILOT_BOOTSTRAP_B64 so the
-    # command line stays short. This replaces the image CMD (/start.sh).
-    return 'base64 -d <<<"$PILOT_BOOTSTRAP_B64" | bash'
 
 
 def build_create_input(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> dict:
@@ -88,7 +139,7 @@ def build_create_input(hourly_cents: int, billing_epoch: int, token: str, repo_u
         "startSsh": True,
         "startJupyter": False,
         "supportPublicIp": True,
-        "dockerArgs": docker_command(),
+        "dockerArgs": docker_args_json(container_script(bootstrap_raw_url(repo_url, repo_ref))),
         "terminateAfter": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref),
     }
@@ -127,10 +178,26 @@ def validate_input(body: dict) -> list[str]:
         problems.append("terminateAfter must be set")
     if body.get("stopAfter"):
         problems.append("stopAfter must be unset; the cap terminates")
-    keys = {item["key"] for item in body.get("env") or []}
+    keys = {item["key"]: item["value"] for item in body.get("env") or []}
     for required in ("PILOT_MAX_SECONDS", "PILOT_MAX_USD_CENTS", "PILOT_HOURLY_CENTS", "PILOT_BILLING_EPOCH"):
         if required not in keys:
             problems.append(f"env missing {required}")
+    if "PILOT_BOOTSTRAP_B64" in keys:
+        problems.append("PILOT_BOOTSTRAP_B64 must not be sent; the script is fetched from the public repo")
+    for key, value in keys.items():
+        if len(value) > ENV_VALUE_LIMIT:
+            problems.append(f"env {key} is {len(value)} bytes, over {ENV_VALUE_LIMIT}")
+    try:
+        entry, cmd = decode_docker_args(body.get("dockerArgs") or "")
+    except json.JSONDecodeError as exc:
+        problems.append(f"dockerArgs is not JSON: {exc}")
+        entry, cmd = [], []
+    if entry != ["/bin/bash", "-c"] or len(cmd) != 1:
+        problems.append("dockerArgs must be bash -c with one script argument")
+    elif "<<<" in cmd[0] or not cmd[0].rstrip().endswith("exec /start.sh"):
+        problems.append("start script must exec /start.sh and must not use a here-string")
+    elif "nohup bash /tmp/pilot-bootstrap.sh" not in cmd[0]:
+        problems.append("start script must launch bootstrap.sh under nohup")
     blob = json.dumps(body)
     if "rest.runpod.io" in blob:
         problems.append("create input mentions the unreachable REST host")
@@ -270,10 +337,65 @@ def _pull_ssh(pod: dict, dest: Path, key_path: str) -> bool:
     return proc.returncode == 0 and any(dest.iterdir())
 
 
+def proxy_base(pod_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", pod_id or ""):
+        raise ValueError(f"pod id {pod_id!r} is not safe in a proxy hostname")
+    return f"https://{pod_id}-8080.proxy.runpod.net"
+
+
 def _http_get(url: str, token: str, timeout: int = 60) -> bytes:
     req = urllib.request.Request(url, headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def pull_server_answered(pod_id: str, token: str, timeout: int = 15) -> bool:
+    """True when our server answered. Cloudflare's 404 means nothing is listening."""
+    try:
+        _http_get(proxy_base(pod_id) + "/", token, timeout=timeout)
+        return True
+    except urllib.error.HTTPError as exc:
+        # 401 is our server. 404 is the proxy with no listener.
+        return exc.code == 401
+    except Exception:
+        return False
+
+
+def _ack(base: str, token: str) -> None:
+    for method in ("POST", "GET"):
+        req = urllib.request.Request(
+            base.rstrip("/") + "/ack",
+            data=b"" if method == "POST" else None,
+            method=method,
+            headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 200:
+                    print(f"acked pull via {method}", flush=True)
+                    return
+        except Exception as exc:  # noqa: BLE001
+            print(f"ack {method} failed: {exc}", flush=True)
+
+
+def _pull_http_base(base: str, dest: Path, token: str) -> bool:
+    try:
+        listing = json.loads(_http_get(base.rstrip("/") + "/", token))
+    except Exception as exc:  # noqa: BLE001
+        print(f"HTTP list {base} failed: {exc}", flush=True)
+        return False
+    files = listing.get("files") or []
+    if not files:
+        return False
+    dest.mkdir(parents=True, exist_ok=True)
+    for rel in files:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = _http_get(base.rstrip("/") + "/" + rel, token, timeout=300)
+        target.write_bytes(data)
+        print(f"pulled {rel} ({len(data)} bytes)", flush=True)
+    _ack(base, token)
+    return True
 
 
 def _pull_http(pod: dict, dest: Path, token: str) -> bool:
@@ -281,29 +403,27 @@ def _pull_http(pod: dict, dest: Path, token: str) -> bool:
     if not found:
         return False
     ip, port = found
-    base = f"http://{ip}:{port}"
-    try:
-        listing = json.loads(_http_get(base + "/", token))
-    except Exception as exc:  # noqa: BLE001
-        print(f"HTTP list failed: {exc}", flush=True)
-        return False
-    files = listing.get("files") or []
-    if not files:
-        return False
-    for rel in files:
-        target = dest / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        data = _http_get(base + "/" + rel, token, timeout=300)
-        target.write_bytes(data)
-        print(f"pulled {rel} ({len(data)} bytes)", flush=True)
-    return True
+    return _pull_http_base(f"http://{ip}:{port}", dest, token)
 
 
 def pull_outputs(pod: dict, dest: Path, token: str, key_path: str) -> str:
-    if _pull_ssh(pod, dest, key_path):
-        return "ssh"
+    """Proxy first. Direct ip:port is blocked from the launcher. SSH is last."""
+    pod_id = str(pod.get("id") or "")
+    if pod_id:
+        try:
+            if _pull_http_base(proxy_base(pod_id), dest, token):
+                return "proxy"
+        except ValueError as exc:
+            print(f"proxy url skipped: {exc}", flush=True)
     if _pull_http(pod, dest, token):
         return "http"
+    if _pull_ssh(pod, dest, key_path):
+        if pod_id:
+            try:
+                _ack(proxy_base(pod_id), token)
+            except ValueError:
+                pass
+        return "ssh"
     return ""
 
 
@@ -319,6 +439,14 @@ def _hourly_from_pod(pod: dict, fallback: int) -> int:
 
 def _status_name(pod: dict) -> str:
     return str(pod.get("desiredStatus") or pod.get("status") or "")
+
+
+def _uptime_seconds(pod: dict) -> int | None:
+    runtime = pod.get("runtime") or {}
+    raw = runtime.get("uptimeInSeconds")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return int(raw)
 
 
 def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
@@ -355,6 +483,7 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "create.json").write_text(json.dumps(redact({"pod": pod, "via": created["via"]}), indent=2) + "\n")
     print(f"pull token (for a manual HTTP fetch): {token}")
+    print(f"proxy: {proxy_base(pod_id)}/")
     print(f"outputs will land in {out_dir}")
 
     def terminate(reason: str) -> None:
@@ -372,24 +501,42 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
             print(f"TERMINATE FAILED: {exc}", flush=True)
             print(f"Delete pod {pod_id} by hand. It may still be billing.")
 
+    best_uptime = None
+    proxy_up = False
     try:
         while True:
             time.sleep(20)
             got = graphql_api.pod_status(pod_id, api_key)
             current = got.get("pod") or {}
+            current.setdefault("id", pod_id)
             elapsed = int(time.time()) - epoch
             rate = _hourly_from_pod(current, hourly)
             spent = cost.cost_cents(elapsed, rate)
             reason = cost.stop_reason(elapsed, rate)
             status = _status_name(current)
+            uptime = _uptime_seconds(current)
+            if uptime is not None:
+                best_uptime = uptime if best_uptime is None else max(best_uptime, uptime)
+            if not proxy_up:
+                proxy_up = pull_server_answered(pod_id, token)
             print(
                 f"[cost] {elapsed}s  {cost.format_usd(spent)}  "
-                f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  via {got.get('via')}",
+                f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  "
+                f"uptime {uptime if uptime is not None else 'none'}  "
+                f"proxy {'up' if proxy_up else 'down'}  via {got.get('via')}",
                 flush=True,
             )
             if reason:
                 terminate(reason)
                 return 0
+            if elapsed >= STARTUP_LIMIT_S and ((best_uptime is None or best_uptime <= 0) or not proxy_up):
+                why = []
+                if best_uptime is None or best_uptime <= 0:
+                    why.append(f"uptimeInSeconds still {best_uptime}")
+                if not proxy_up:
+                    why.append("pull server never answered on the proxy")
+                terminate("startup failed: " + "; ".join(why))
+                return 1
             if status in {"TERMINATED", "EXITED", "ERROR"} or current.get("desiredStatus") in {"TERMINATED"}:
                 terminate(f"pod status {status}")
                 return 0 if status == "EXITED" else 1
@@ -404,6 +551,66 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
     except KeyboardInterrupt:
         terminate("interrupted")
         return 1
+
+
+def rehearse_container_start() -> None:
+    """Exec the argv RunPod builds. /workspace is a private mount, not this repo.
+
+    Docker is not required. The pytorch image is not started. This checks the
+    exec semantics that crashed pod umpal4do5pop5k: a pipe is not a shell.
+    """
+    import http.server
+    import socketserver
+    import tempfile
+    import threading
+
+    old = 'base64 -d <<<"$PILOT_BOOTSTRAP_B64" | bash'
+    old_argv = shlex.split(old)
+    if "|" not in old_argv:
+        raise RuntimeError("expected the old dockerArgs pipe to be a bare argv")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        marker = root / "job"
+        boot = root / "bootstrap.sh"
+        boot.write_text(f"#!/bin/bash\necho job-ok > {shlex.quote(str(marker))}\n", encoding="utf-8")
+        boot.chmod(0o755)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                data = boot.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            script = container_script(f"http://127.0.0.1:{port}/bootstrap.sh")
+            entry, cmd = decode_docker_args(docker_args_json(script))
+            if entry != ["/bin/bash", "-c"] or cmd != [script]:
+                raise RuntimeError("dockerArgs JSON did not decode to one bash -c script")
+            wrapper = 'mkdir -p /tmp/ws && mount --bind /tmp/ws /workspace && exec "$@"'
+            proc = subprocess.run(
+                ["unshare", "--user", "--map-root-user", "--mount", "bash", "-c", wrapper, "runpod", *entry, *cmd],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            time.sleep(0.5)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        if not marker.exists() or "job-ok" not in marker.read_text(encoding="utf-8"):
+            raise RuntimeError(f"bootstrap did not run under bash -c: {proc.stderr[-400:]}")
+        if "/start.sh" not in (proc.stderr or ""):
+            raise RuntimeError(f"exec /start.sh did not run: rc={proc.returncode} stderr={proc.stderr[-400:]}")
 
 
 def main(argv: list[str]) -> int:
