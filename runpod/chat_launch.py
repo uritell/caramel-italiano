@@ -147,6 +147,16 @@ def build_create_input(
     return body
 
 
+def dollar_stop_seconds(hourly_cents: int, cap_cents: int) -> int:
+    """First second at which the watchdog's cent rounding reaches the cap."""
+    if hourly_cents <= 0 or cap_cents <= 0:
+        return 10**9
+    need = cap_cents * 3600 - 3599
+    if need <= 0:
+        return 0
+    return (need + hourly_cents - 1) // hourly_cents
+
+
 def validate(body: dict, wall_s: int = DEFAULT_MINUTES * 60, cap_cents: int = DEFAULT_CAP_CENTS) -> list[str]:
     problems = []
     if body.get("cloudType") != "SECURE":
@@ -170,6 +180,22 @@ def validate(body: dict, wall_s: int = DEFAULT_MINUTES * 60, cap_cents: int = DE
         problems.append("pod time cap env does not match")
     if not keys.get("CHAT_TOKEN"):
         problems.append("chat token missing")
+    if keys.get("PILOT_WATCH_JOB"):
+        problems.append("a chat pod must not set PILOT_WATCH_JOB (that is the training pull-grace terminate)")
+    try:
+        hourly = int(keys.get("PILOT_HOURLY_CENTS") or "0")
+    except ValueError:
+        hourly = 0
+    if hourly <= 0 or hourly > MAX_PRICE_CENTS:
+        problems.append(f"chat hourly cents must be 1..{MAX_PRICE_CENTS}, got {hourly}")
+    else:
+        # $1.50 at $12/h is 447 s. The launcher refuses a quote that would do that.
+        stop_at = dollar_stop_seconds(hourly, cap_cents)
+        if stop_at <= 8 * 60:
+            problems.append(
+                f"dollar cap would delete the pod after {stop_at}s "
+                f"at {hourly} cents/hour (the 7.5 min failure)"
+            )
     try:
         spec = json.loads(body.get("dockerArgs") or "")
     except json.JSONDecodeError:

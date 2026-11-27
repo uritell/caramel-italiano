@@ -17,12 +17,16 @@ if ! git clone --recurse-submodules --branch "$ref" "$repo" "$dest"; then
 fi
 log "cloned $ref"
 
+# Do not export PILOT_WATCH_JOB. That flag is the training pull-grace
+# terminate from the pilot watchdog. A chat pod that inherited it would
+# delete itself with no terminate line in the launcher log.
+unset PILOT_WATCH_JOB || true
 if command -v setsid >/dev/null 2>&1; then
   setsid bash "$dest/runpod/watchdog.sh" </dev/null >>/workspace/chat-logs/watchdog.log 2>&1 &
 else
   nohup bash "$dest/runpod/watchdog.sh" </dev/null >>/workspace/chat-logs/watchdog.log 2>&1 &
 fi
-log "watchdog started with bash"
+log "watchdog started with bash (chat: no DONE/FAILED self-terminate)"
 
 if ! python - <<'PY'
 import inspect, sys

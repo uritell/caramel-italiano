@@ -71,10 +71,9 @@ class FakeMimi:
         )
 
     def decode(self, audio_codes, padding_cache=None, use_streaming=None, decoder_cache=None):
-        if not use_streaming:
-            raise AssertionError("decode should stream")
+        frames = int(audio_codes.shape[-1])
         return SimpleNamespace(
-            audio_values=torch.full((1, 1, FRAME), 0.25),
+            audio_values=torch.full((1, 1, frames * FRAME), 0.25),
             padding_cache={"dec": 1},
             decoder_cache={"ok": True},
         )
@@ -109,15 +108,21 @@ async def read_http(reader: asyncio.StreamReader) -> tuple[int, dict, bytes]:
 
 
 def check_loop() -> None:
+    from live import DECODE_CONTEXT
+
     mimi = FakeMimi()
-    loop = LiveLoop(FakeModel(), mimi)
+    loop = LiveLoop(FakeModel(context=32), mimi, gate=False)
     first = loop.push(np.zeros(FRAME, dtype=np.float32))
     if first.pcm.size != 0 or first.reset:
         raise SystemExit(f"first frame should be silent, got {first}")
-    second = loop.push(np.full(FRAME, 0.001, dtype=np.float32))
-    if second.pcm.size != FRAME or not mimi.streaming:
-        raise SystemExit(f"second frame did not return streamed audio: {second.pcm.size} streaming={mimi.streaming}")
-    if abs(float(second.pcm[0]) - 0.25) > 1e-5:
+    heard = None
+    for _ in range(DECODE_CONTEXT + 2):
+        heard = loop.push(np.full(FRAME, 0.001, dtype=np.float32))
+        if heard.pcm.size:
+            break
+    if heard is None or heard.pcm.size != FRAME or not mimi.streaming:
+        raise SystemExit(f"windowed decode did not return audio: {None if heard is None else heard.pcm.size}")
+    if abs(float(heard.pcm[0]) - 0.25) > 1e-5:
         raise SystemExit("decoded audio was not the fake codec output")
     short = LiveLoop(FakeModel(context=2), FakeMimi())
     short.push(np.zeros(FRAME, dtype=np.float32))
@@ -162,6 +167,14 @@ def check_plan() -> None:
         raise SystemExit(f"launcher sampling defaults drifted: {values.get('CHAT_TEMP')} {values.get('CHAT_TOP_K')}")
     if values.get("PILOT_MAX_USD_CENTS") != "150" or values.get("PILOT_MAX_SECONDS") != "3600":
         raise SystemExit("chat caps changed")
+    if values.get("PILOT_WATCH_JOB"):
+        raise SystemExit("chat create input arms the training pull-grace terminate")
+    if chat_launch.dollar_stop_seconds(59, 150) <= 8 * 60:
+        raise SystemExit("an A40 at $0.59/h would hit the $1.50 cap during a short chat")
+    if chat_launch.dollar_stop_seconds(1200, 150) != 448:
+        raise SystemExit(
+            f"$1.50 at $12/h should die at 448s, got {chat_launch.dollar_stop_seconds(1200, 150)}"
+        )
     if body["containerDiskInGb"] != 40 or body["gpuCount"] != 1:
         raise SystemExit("disk or gpu count is wrong")
     if "EU-RO-1" not in body["dataCenterIds"]:
