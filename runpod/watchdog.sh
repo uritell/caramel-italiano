@@ -99,7 +99,45 @@ self_test() {
     echo "watchdog self-test failed: 60s should not trip the cap" >&2
     exit 1
   fi
+  # Option A wall: 1.9 h at the quoted rate must trip. One minute must not.
+  if ! cap_due 6840 439 6840 900; then
+    echo "watchdog self-test failed: 1.9h should trip the option A wall" >&2
+    exit 1
+  fi
   echo "watchdog ok (bash)"
+}
+
+flush_artifacts() {
+  local out="${PILOT_OUT:-/workspace/pilot-out}"
+  local work="${PILOT_WORK:-/workspace/work}"
+  mkdir -p "$out/checkpoints" "$out/stores"
+  local f rel
+  if [[ -d "$work/runs" ]]; then
+    while IFS= read -r f; do
+      rel="${f#"$work/runs/"}"
+      mkdir -p "$out/checkpoints/$(dirname "$rel")"
+      cp -f "$f" "$out/checkpoints/$rel" || true
+    done < <(find "$work/runs" -type f \( -name best.pt -o -name ckpt.pt \) 2>/dev/null)
+  fi
+  if [[ -d "$work/stores" ]]; then
+    cp -a "$work/stores/." "$out/stores/" 2>/dev/null || true
+  fi
+}
+
+wait_for_pull() {
+  local out="${PILOT_OUT:-/workspace/pilot-out}"
+  local grace="${PILOT_CAP_PULL_S:-90}"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$out/CAP"
+  local i=0
+  while [[ "$i" -lt "$grace" ]]; do
+    if [[ -f "$out/PULLED" && "$out/PULLED" -nt "$out/CAP" ]]; then
+      echo "artifacts pulled"
+      return 0
+    fi
+    sleep 5
+    i=$((i + 5))
+  done
+  echo "pull grace ${grace}s elapsed"
 }
 
 if [[ "${1:-}" == "--once" ]]; then
@@ -131,6 +169,8 @@ while true; do
     "$elapsed" "$cost" "$max_cents" "$max_s"
   if cap_due "$elapsed" "$hourly" "$max_s" "$max_cents"; then
     echo "watchdog cap reached"
+    flush_artifacts || true
+    wait_for_pull || true
     terminate_pod && exit 0
     sleep 15
     continue

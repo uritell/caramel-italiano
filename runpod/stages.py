@@ -52,27 +52,41 @@ def _one_gpu(py: str, extra: list[str], out: Path) -> list[str]:
 
 def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> list[tuple[str, list[str], dict[str, str]]]:
     """(name, argv, extra env). Every stage is one process on GPU 0."""
+    p = _plan()
+    s1_stop, s2_end, s3_end = p["s1_stop"], p["s2_end"], p["s3_end"]
     s1, s2, s3 = runs / "s1", runs / "s2", runs / "s3"
     pin = {"CUDA_VISIBLE_DEVICES": "0"}
+    # Option A evaluates often enough that best.pt exists if the cap hits mid-stage.
+    # Patience stays 0 here so a noisy early eval does not end the stage.
+    mid = []
+    if p.get("save_during_stage"):
+        mid = [
+            "--dev", str(dev),
+            "--eval_every", str(p["eval_every"]),
+            "--patience", "0",
+            "--save_best",
+        ]
     stage1 = _one_gpu(py, [
         "--data", str(mono),
-        "--steps", str(S2_END),
-        "--stop_at", str(S1_STOP),
-        "--warmup", str(S1_WARMUP),
+        "--steps", str(s2_end),
+        "--stop_at", str(s1_stop),
+        "--warmup", str(p["s1_warmup"]),
+        *mid,
     ], s1)
     stage2 = _one_gpu(py, [
         "--data", str(stereo), str(mono),
         "--weights", "0.8", "0.2",
-        "--steps", str(S2_END),
+        "--steps", str(s2_end),
         "--resume", str(s1 / "ckpt.pt"),
+        *mid,
     ], s2)
     stage3 = _one_gpu(py, [
         "--data", str(stereo), str(mono),
         "--weights", "0.8", "0.2",
-        "--steps", str(S3_END),
+        "--steps", str(s3_end),
         "--resume", str(s2 / "ckpt.pt"),
-        "--sched_start", str(S2_END),
-        "--warmup", str(S3_WARMUP),
+        "--sched_start", str(s2_end),
+        "--warmup", str(p["s3_warmup"]),
         "--lr", S3_LR,
         "--dev", str(dev),
         "--eval_every", str(S3_EVAL_EVERY),

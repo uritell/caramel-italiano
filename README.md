@@ -119,9 +119,12 @@ Budget cap: **USD 50**. No rental without a quote and a yes.
    step 401, then 1072, then 1981. The one-GPU retry (100 h mono, 80 h
    synthetic stereo, the DataHive sample) stops at 156, then 622, then
    1254. See `train/README.md` and `runpod/README.md`.
-   `python runpod/launch.py --dry-run` checks the plan and creates
-   nothing. `python runpod/launch.py --launch` is the command that rents
-   one H100 SXM pod, capped at 2.5 h or $12. On-demand price
+   `python3 runpod/launch.py --dry-run` checks the smaller retry and creates
+   nothing. `python3 runpod/launch.py --launch` rents one H100 SXM pod,
+   capped at 2.5 h or $12. The larger open-data run is
+   `python3 runpod/launch.py --config optionA --dry-run`, and
+   `python3 runpod/launch.py --config optionA --launch` only when you mean
+   to spend. That run is capped at $9 or 1.9 hours. On-demand price
    checks from the planning pass (USD, before tax, 27 Nov 2026): about
    $1.73/h (Vast.ai verified offer), $4.39/h (RunPod H100), $4.89/h
    (Lambda H100). The author's full caramel-1 run was about 4 H100

@@ -8,6 +8,8 @@ with one GPU's 24,000 frames per step.
 """
 from __future__ import annotations
 
+import os
+
 GPU_COUNT = 1
 MONO_HOURS = 100.0
 SYNTH_STEREO_HOURS = 80.0
@@ -35,6 +37,9 @@ def _steps(hours: float, passes: float, gpus: int, weight: float = 1.0) -> int:
 
 
 def plan(gpus: int = GPU_COUNT) -> dict:
+    if os.environ.get("PILOT_CONFIG") == "optionA":
+        from option_a import training_plan
+        return training_plan(gpus)
     s1 = _steps(MONO_HOURS, MONO_PASSES, gpus)
     s2 = _steps(STEREO_HOURS, STEREO_PASSES_S2, gpus, STEREO_WEIGHT)
     s3 = _steps(STEREO_HOURS, STEREO_PASSES_S3, gpus, STEREO_WEIGHT)

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import cost
 import graphql_api
+import option_a
 import stages
 
 HERE = Path(__file__).resolve().parent
@@ -100,13 +101,21 @@ def decode_docker_args(raw: str) -> tuple[list[str], list[str]]:
     return [], shlex.split(text)
 
 
-def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> list[dict]:
+def build_env(
+    hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str,
+    wall_s: int | None = None, cap_cents: int | None = None, config_name: str = "pilot",
+) -> list[dict]:
+    wall_s = cost.MAX_WALL_S if wall_s is None else wall_s
+    cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
     env = {
         "PILOT_BILLING_EPOCH": str(billing_epoch),
-        "PILOT_MAX_SECONDS": str(cost.MAX_WALL_S),
-        "PILOT_MAX_USD_CENTS": str(cost.MAX_USD_CENTS),
+        "PILOT_MAX_SECONDS": str(wall_s),
+        "PILOT_MAX_USD_CENTS": str(cap_cents),
         "PILOT_HOURLY_CENTS": str(hourly_cents),
         "PILOT_GPU_COUNT": str(cost.GPU_COUNT),
+        "PILOT_CONFIG": config_name,
+        "PILOT_WORK": "/workspace/work",
+        "PILOT_CAP_PULL_S": "90",
         "PILOT_PULL_TOKEN": token,
         "PILOT_OUT": "/workspace/pilot-out",
         "PILOT_PULL_PORT": "8080",
@@ -123,15 +132,34 @@ def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, 
     return [{"key": k, "value": v} for k, v in env.items()]
 
 
-def build_create_input(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> dict:
-    deadline = datetime.fromtimestamp(billing_epoch + cost.MAX_WALL_S, tz=timezone.utc)
+def option_a_emo_url() -> str:
+    return "https://zenodo.org/records/12616095/files/emozionalmente.zip"
+
+
+def limits_for(config_name: str) -> dict:
+    if config_name == "pilot":
+        return {"wall_s": cost.MAX_WALL_S, "cap_cents": cost.MAX_USD_CENTS, "disk_gb": cost.CONTAINER_DISK_GB}
+    if config_name == "optionA":
+        return {"wall_s": option_a.MAX_WALL_S, "cap_cents": option_a.MAX_USD_CENTS, "disk_gb": option_a.DISK_GB}
+    raise SystemExit(f"unknown --config {config_name!r} (use pilot or optionA)")
+
+
+def build_create_input(
+    hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str,
+    wall_s: int | None = None, cap_cents: int | None = None, disk_gb: int | None = None,
+    config_name: str = "pilot",
+) -> dict:
+    wall_s = cost.MAX_WALL_S if wall_s is None else wall_s
+    cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
+    disk_gb = cost.CONTAINER_DISK_GB if disk_gb is None else disk_gb
+    deadline = datetime.fromtimestamp(billing_epoch + wall_s, tz=timezone.utc)
     return {
-        "name": "caramel-it-pilot",
+        "name": "caramel-it-optionA" if config_name == "optionA" else "caramel-it-pilot",
         "cloudType": "SECURE",
         "gpuCount": cost.GPU_COUNT,
         "gpuTypeId": GPU_ID,
         "imageName": IMAGE,
-        "containerDiskInGb": cost.CONTAINER_DISK_GB,
+        "containerDiskInGb": disk_gb,
         "volumeInGb": 0,
         "minVcpuCount": 8,
         "minMemoryInGb": 16,
@@ -142,7 +170,7 @@ def build_create_input(hourly_cents: int, billing_epoch: int, token: str, repo_u
         "supportPublicIp": True,
         "dockerArgs": docker_args_json(container_script(bootstrap_raw_url(repo_url, repo_ref))),
         "terminateAfter": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref),
+        "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref, wall_s, cap_cents, config_name),
     }
 
 
@@ -242,16 +270,24 @@ def check_quote(api_key: str) -> tuple[int, dict]:
     return cents, quote
 
 
-def print_plan(body: dict, hourly_cents: int) -> None:
-    stop_at, why = cost.first_stop(hourly_cents)
-    wall_cost = cost.cost_cents(cost.MAX_WALL_S, hourly_cents)
+def print_plan(body: dict, hourly_cents: int, wall_s: int | None = None, cap_cents: int | None = None) -> None:
+    wall_s = cost.MAX_WALL_S if wall_s is None else wall_s
+    cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
+    disk_gb = body.get("containerDiskInGb", cost.CONTAINER_DISK_GB)
+    stop_at, why = wall_s, "wall"
+    for t in range(0, wall_s + 1):
+        reason = cost.stop_reason(t, hourly_cents, wall_s, cap_cents)
+        if reason:
+            stop_at, why = t, reason
+            break
+    wall_cost = cost.cost_cents(wall_s, hourly_cents)
     print(f"image: {IMAGE}")
     print(f"gpu:   {cost.GPU_COUNT}x {GPU_ID}  Secure Cloud")
-    print(f"disk:  {cost.CONTAINER_DISK_GB} GB container disk, volumeInGb 0, no network volume")
+    print(f"disk:  {disk_gb} GB container disk, volumeInGb 0, no network volume")
     print(f"rate:  {cost.format_usd(hourly_cents)} per pod-hour")
-    print(f"cap:   {cost.MAX_WALL_S / 3600:.1f} h or {cost.format_usd(cost.MAX_USD_CENTS)}, whichever first")
+    print(f"cap:   {wall_s / 3600:.1f} h or {cost.format_usd(cap_cents)}, whichever first")
     print(f"       at this rate the first stop is {stop_at}s ({why})")
-    print(f"       bill at 2.5 h would be {cost.format_usd(wall_cost)}")
+    print(f"       bill at the time cap would be {cost.format_usd(wall_cost)}")
     print(f"api:   {graphql_api.GRAPHQL_URL}")
     print("ops:   podFindAndDeployOnDemand, pod, podStop, podTerminate")
     print()
@@ -260,13 +296,38 @@ def print_plan(body: dict, hourly_cents: int) -> None:
         Path("tokenize/out/dev"), Path("runs"))))
 
 
-def dry_run(repo_url: str, repo_ref: str) -> int:
+def _option_a_gate(hourly_cents: int) -> str | None:
+    est = option_a.estimate(hourly_cents)
+    print("Option A phase estimate (retry rates, not a new measurement):")
+    print(option_a.explain_estimate(est))
+    if est["over_abort"]:
+        return f"GPU estimate {cost.format_usd(est['gpu_cents'])} is above $8"
+    return None
+
+
+def dry_run(repo_url: str, repo_ref: str, config_name: str = "pilot") -> int:
+    lim = limits_for(config_name)
     epoch = int(time.time())
-    body = build_create_input(cost.QUOTED_HOURLY_CENTS, epoch, "dry-run-token", repo_url, repo_ref)
+    body = build_create_input(
+        cost.QUOTED_HOURLY_CENTS, epoch, "dry-run-token", repo_url, repo_ref,
+        lim["wall_s"], lim["cap_cents"], lim["disk_gb"], config_name,
+    )
     problems = validate_input(body)
+    if config_name == "optionA":
+        gate = _option_a_gate(cost.QUOTED_HOURLY_CENTS)
+        if gate:
+            problems.append(gate)
     script_problems = _local_scripts()
     problems.extend(script_problems)
-    print_plan(body, cost.QUOTED_HOURLY_CENTS)
+    print_plan(body, cost.QUOTED_HOURLY_CENTS, lim["wall_s"], lim["cap_cents"])
+    if config_name == "optionA":
+        try:
+            req = urllib.request.Request(option_a_emo_url(), method="HEAD")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status >= 400:
+                    problems.append(f"Emozionalmente zip returned {resp.status}")
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"Emozionalmente zip did not answer: {exc}")
     print()
     print("create input (secrets removed):")
     print(json.dumps(redact(body), indent=2)[:4000])
@@ -277,7 +338,9 @@ def dry_run(repo_url: str, repo_ref: str) -> int:
     )
     if head.returncode != 0:
         problems.append("a public data URL returned 404 or 410")
-    check = subprocess.run([sys.executable, str(HERE / "self_check.py")], cwd=str(ROOT))
+    check_env = os.environ.copy()
+    check_env.pop("PILOT_CONFIG", None)
+    check = subprocess.run([sys.executable, str(HERE / "self_check.py")], cwd=str(ROOT), env=check_env)
     if check.returncode != 0:
         problems.append("self_check failed")
     if problems:
@@ -511,13 +574,20 @@ def _uptime_seconds(pod: dict) -> int | None:
     return int(raw)
 
 
-def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
+def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str, config_name: str = "pilot") -> int:
     api_key = os.environ.get("RUNPOD_API_KEY", "")
     if not api_key:
         print("RUNPOD_API_KEY is not set. Nothing was created.")
         return 1
+    lim = limits_for(config_name)
     per_gpu, quote = check_quote(api_key)
     hourly = cost.hourly_cents(per_gpu)
+    if config_name == "optionA":
+        gate = _option_a_gate(hourly)
+        if gate:
+            print(gate)
+            print("Nothing was created.")
+            return 1
     print(
         f"catalog {quote.get('id')} securePrice={quote.get('securePrice')} "
         f"-> {cost.format_usd(hourly)}/pod-hour",
@@ -525,14 +595,17 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
     )
     token = secrets.token_urlsafe(24)
     epoch = int(time.time())
-    body = build_create_input(hourly, epoch, token, repo_url, repo_ref)
+    body = build_create_input(
+        hourly, epoch, token, repo_url, repo_ref,
+        lim["wall_s"], lim["cap_cents"], lim["disk_gb"], config_name,
+    )
     problems = validate_input(body)
     if problems:
         print("refusing to create:")
         for item in problems:
             print(f"  - {item}")
         return 1
-    print_plan(body, hourly)
+    print_plan(body, hourly, lim["wall_s"], lim["cap_cents"])
     print("creating the pod via GraphQL podFindAndDeployOnDemand", flush=True)
     created = graphql_api.create_pod(body, api_key)
     pod = created["pod"]
@@ -548,10 +621,15 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
     print(f"proxy: {proxy_base(pod_id)}/")
     print(f"outputs will land in {out_dir}")
 
-    return follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod)
+    return follow(
+        pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod,
+        lim["wall_s"], lim["cap_cents"],
+    )
 
 
-def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None) -> int:
+def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wall_s=None, cap_cents=None) -> int:
+    wall_s = cost.MAX_WALL_S if wall_s is None else wall_s
+    cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
     if pod is None:
         pod = {"id": pod_id}
     def terminate(reason: str) -> None:
@@ -613,7 +691,7 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None) ->
             elapsed = int(time.time()) - epoch
             rate = _hourly_from_pod(current, hourly)
             spent = cost.cost_cents(elapsed, rate)
-            reason = cost.stop_reason(elapsed, rate)
+            reason = cost.stop_reason(elapsed, rate, wall_s, cap_cents)
             status = _status_name(current)
             uptime = _uptime_seconds(current)
             if uptime is not None:
@@ -719,6 +797,8 @@ def rehearse_container_start() -> None:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", default="pilot", choices=["pilot", "optionA"],
+                   help="pilot is the $12 retry; optionA is the $9 larger run")
     p.add_argument("--launch", action="store_true", help="create the pod and watch it")
     p.add_argument("--dry-run", action="store_true", help="validate only (this is also the default)")
     p.add_argument("--repo-url", default=os.environ.get("CARAMEL_REPO_URL", REPO_URL_DEFAULT))
@@ -728,14 +808,15 @@ def main(argv: list[str]) -> int:
     p.add_argument("--resume-from", type=Path, default=None,
                    help="upload stores/ and checkpoints/ from this directory once the new pod answers")
     args = p.parse_args(argv)
+    os.environ["PILOT_CONFIG"] = args.config
     if args.resume_from:
         os.environ["PILOT_RESUME_FROM"] = str(args.resume_from)
     if args.launch and args.dry_run:
         print("Pass either --launch or --dry-run.")
         return 2
     if not args.launch:
-        return dry_run(args.repo_url, args.repo_ref)
-    return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key)
+        return dry_run(args.repo_url, args.repo_ref, args.config)
+    return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key, args.config)
 
 
 if __name__ == "__main__":

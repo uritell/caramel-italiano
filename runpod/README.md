@@ -24,6 +24,30 @@ so the clock hits first. A run that finishes in about 2 hours is about **$9**.
 
 Common Voice is not downloaded. It needs a Mozilla Data Collective account.
 
+## Option A ($9, one H100, the open pools)
+
+This does not spend money:
+
+```bash
+python3 runpod/launch.py --config optionA --dry-run
+```
+
+The dry run prints a phase estimate from the retry's measured rates and
+refuses the plan when that GPU estimate is above $8. The pod, if you
+later launch it, is one Secure H100 SXM. The hard cap is **$9.00** or
+**1.9 hours**, whichever comes first. Container disk is 250 GB at
+$0.10/GB/month while the pod is running, and there is no volume disk.
+
+```bash
+python3 runpod/launch.py --config optionA --launch
+```
+
+`--launch` is the command that rents the machine. The run uses all of
+MLS Italian, FLEURS Italian, and Emozionalmente, about 218 h of synthetic
+stereo, and the same DataHive hold-out as the retry. It starts from
+scratch: the retry checkpoint does not contain the optimizer state
+`train.py` needs to resume.
+
 ## Check, then launch
 
 From the repo root:
