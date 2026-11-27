@@ -276,10 +276,140 @@ async def check_server() -> None:
     print("server ok")
 
 
+def check_upload_fail_fast() -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import chat_upload
+
+    posts = {"n": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = b'{"ok":true,"have":[],"complete":false}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or "0")
+            if length:
+                self.rfile.read(length)
+            posts["n"] += 1
+            body = b"too large"
+            self.send_response(413)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        folder = Path("/tmp/caramel-chunk-src")
+        folder.mkdir(exist_ok=True)
+        src = folder / "weights.bin"
+        src.write_bytes(b"weights-that-must-not-be-retried-as-one-body")
+        try:
+            chat_upload.upload_file(
+                f"http://127.0.0.1:{port}", "secret", src, "model/model.safetensors",
+                chunk_bytes=16, attempts=5,
+            )
+            raise SystemExit("HTTP 413 did not abort the upload")
+        except chat_upload.UploadFailed as exc:
+            if exc.status != 413:
+                raise SystemExit(f"expected status 413, got {exc.status}: {exc}")
+        if posts["n"] != 1:
+            raise SystemExit(f"413 was sent again ({posts['n']} posts); the launch would keep billing")
+    finally:
+        httpd.shutdown()
+
+    listed = {"ids": ["pod-chat", "someone-else"]}
+    calls = []
+
+    def terminate(pod_id, api_key):
+        calls.append(pod_id)
+        listed["ids"] = [item for item in listed["ids"] if item != pod_id]
+        return {"via": "test"}
+
+    def list_ids(api_key):
+        return list(listed["ids"])
+
+    left = chat_upload.confirm_pod_gone("pod-chat", "k", terminate, list_ids, pause=lambda _s: None)
+    if calls != ["pod-chat"] or left != ["someone-else"]:
+        raise SystemExit(f"terminate did not stop only the chat pod: calls={calls} left={left}")
+    text = (ROOT / "runpod" / "chat_launch.py").read_text(encoding="utf-8")
+    if "upload will retry" in text:
+        raise SystemExit("a failed upload still loops inside the cost watch")
+    if "DEFAULT_CAP_CENTS = 150" not in text or "DEFAULT_MINUTES = 60" not in text:
+        raise SystemExit("chat caps changed")
+    print("upload fail-fast ok")
+
+
+async def check_chunked_upload() -> None:
+    import chat_upload
+
+    payload = bytes((i * 17) % 256 for i in range(100))
+    src_dir = Path("/tmp/caramel-chunk-src")
+    src_dir.mkdir(exist_ok=True)
+    src = src_dir / "model.safetensors"
+    src.write_bytes(payload)
+    model_dir = Path("/tmp/caramel-chunk-dst")
+    if model_dir.exists():
+        import shutil
+        shutil.rmtree(model_dir)
+    model_dir.mkdir()
+    chat = server.ChatServer("secret", model_dir, None, lambda reason: None, idle_s=60)
+    running = await server.serve(chat, "127.0.0.1", 0)
+    port = running.sockets[0].getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    try:
+        sha = chat_upload.file_sha256(src)
+        headers = {
+            "X-Pilot-Path": "model/model.safetensors",
+            "X-Chunk-Index": "0",
+            "X-Chunk-Offset": "0",
+            "X-Chunk-Bytes": "40",
+            "X-Total-Size": str(len(payload)),
+            "X-File-Sha256": sha,
+            "Content-Type": "application/octet-stream",
+        }
+        code, _raw = await asyncio.to_thread(
+            chat_upload._call, "POST", base + "/upload", "secret", payload[:40], headers,
+        )
+        if code != 200:
+            raise SystemExit(f"first chunk failed: {code}")
+        await asyncio.to_thread(
+            chat_upload.upload_file, base, "secret", src, "model/model.safetensors", 40, 3,
+        )
+        stored = (model_dir / "model.safetensors").read_bytes()
+        if stored != payload:
+            raise SystemExit("assembled file does not match the upload")
+        if chat.upload_writes != 3:
+            raise SystemExit(f"resume re-sent stored chunks (writes={chat.upload_writes})")
+        await asyncio.to_thread(
+            chat_upload.upload_file, base, "secret", src, "model/model.safetensors", 40, 3,
+        )
+        if chat.upload_writes != 3:
+            raise SystemExit("a finished file was uploaded again")
+    finally:
+        chat.stopping = True
+        running.close()
+        await running.wait_closed()
+    print("chunked upload ok")
+
+
 def main() -> int:
     check_loop()
     check_plan()
+    check_upload_fail_fast()
     asyncio.run(check_server())
+    asyncio.run(check_chunked_upload())
     print("chat test ok")
     return 0
 

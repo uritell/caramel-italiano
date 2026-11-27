@@ -197,6 +197,10 @@ export RUNPOD_API_KEY=...
 python runpod/chat_launch.py --launch --model-dir runpod/retrieved/605n4gr7j7dz7z/caramel-it
 ```
 
+The weights go through the proxy in 32 MB pieces (`--chunk-mb`, at most 50).
+If the proxy rejects a piece, the script deletes the pod. It does not keep
+uploading until the money cap.
+
 The script prints one https address. Open it. Press the big Start button
 and allow the microphone. You should see "Listening", a delay in
 milliseconds, and how many minutes are left on the memory. Press Stop
