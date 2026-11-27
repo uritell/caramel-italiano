@@ -33,6 +33,10 @@ DEFAULT_TEMP = 0.75
 DEFAULT_TOP_K = 25
 DEFAULT_VAD_RMS = 0.02
 DEFAULT_HANGOVER_MS = 500
+# Mimi's decoder has no streaming conv cache. One code frame decoded alone
+# starts from silence and clicks. Eight frames of left context, then the last
+# 80 ms, matches a full decode.
+DECODE_CONTEXT = 8
 
 
 @dataclass
@@ -130,23 +134,27 @@ def encode_frame(mimi, wave: torch.Tensor, state: _CodecState) -> torch.Tensor:
     return codes.to(dtype=torch.long).view(8)
 
 
-def decode_frame(mimi, codes: torch.Tensor, state: _CodecState) -> torch.Tensor:
-    """Stream-decode 8 aligned codes to PCM. codes is [8]."""
-    params = inspect.signature(mimi.decode).parameters
-    kwargs = {}
-    if "use_streaming" in params:
-        kwargs["use_streaming"] = True
-    if "padding_cache" in params:
-        kwargs["padding_cache"] = state.dec_pad
-    _fill(kwargs, params, ("decoder_cache", "decoder_past_key_values"), state.dec_cache)
-    out = mimi.decode(codes.view(1, 8, 1), **kwargs)
+def decode_window(mimi, codes: torch.Tensor) -> torch.Tensor:
+    """Decode [T, 8] aligned codes in one call and return the newest frame.
+
+    A one-frame decode has no left context, so the causal convolutions start
+    from zero and the frame boundary is a click. The tail of a short window
+    is the same audio a full-utterance decode would have produced there.
+    """
+    if codes.dim() != 2 or codes.shape[1] != 8:
+        raise ValueError(f"expected [T, 8] codes, got {tuple(codes.shape)}")
+    window = codes.transpose(0, 1).unsqueeze(0).contiguous()  # [1, 8, T]
+    try:
+        device = next(mimi.parameters()).device
+    except (AttributeError, StopIteration):
+        device = window.device
+    window = window.to(device=device)
+    out = mimi.decode(window)
     audio = out.audio_values if hasattr(out, "audio_values") else out[0]
-    if hasattr(out, "padding_cache"):
-        state.dec_pad = out.padding_cache
-    state.dec_cache = getattr(out, "decoder_cache", None)
-    if state.dec_cache is None:
-        state.dec_cache = getattr(out, "decoder_past_key_values", None)
-    return audio[0, 0] if audio.dim() == 3 else audio.reshape(-1)
+    flat = audio.reshape(-1)
+    if flat.numel() >= FRAME:
+        return flat[-FRAME:]
+    return flat
 
 
 def frame_rms(wave: torch.Tensor) -> float:
@@ -193,6 +201,8 @@ class LiveLoop:
         self.inp = torch.full((1, int(self.cfg.n_q)), self.card, dtype=torch.long, device=self.device)
         self.forced = torch.full((1, int(self.cfg.dep_q)), -2, dtype=torch.long, device=self.device)
         self.codec = _CodecState()
+        self._code_hist: list[torch.Tensor] = []
+        self.heard_codes: list[list[int]] = []
         self.graph = None
         self.out = None
         self._reset_flags()
@@ -206,6 +216,7 @@ class LiveLoop:
         self.prev_model_delayed = None
         self.frame_index = 0
         self._hang_left = 0
+        self._code_hist = []
         self.codec.clear()
 
     def _zero_state(self) -> None:
@@ -321,11 +332,18 @@ class LiveLoop:
         ms = (time.perf_counter() - t0) * 1e3
         ready = aligned_from_delayed(self.prev_model_delayed, out, self.delays, self.card)
         pcm = np.zeros(0, dtype=np.float32)
+        if ready is not None:
+            self._code_hist.append(ready.detach().to(dtype=torch.long, device="cpu"))
+            if len(self._code_hist) > DECODE_CONTEXT:
+                del self._code_hist[0]
+            self.heard_codes.append([int(v) for v in ready.detach().cpu().reshape(-1)])
         if ready is not None and gated:
+            # Zeros while the person is talking. The codes stay in the window
+            # so the next audible frame is not a cold decoder start.
             pcm = np.zeros(FRAME, dtype=np.float32)
-        elif ready is not None:
-            audio = decode_frame(self.mimi, ready, self.codec).detach().float().cpu().numpy().reshape(-1)
-            pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        elif ready is not None and len(self._code_hist) >= DECODE_CONTEXT:
+            audio = decode_window(self.mimi, torch.stack(self._code_hist, dim=0))
+            pcm = np.ascontiguousarray(audio.detach().float().cpu().numpy().reshape(-1), dtype=np.float32)
         self.prev_model_delayed = out.detach().clone()
         self.prev_model = out.detach().clone()
         self.prev_human = human_delayed.detach().clone()

@@ -87,7 +87,7 @@ resources || true
 if [[ "$MODE" == full ]]; then
   nvidia-smi || true
   if [[ ! -f /tmp/pilot-watchdog.pid ]]; then
-    setsid bash "$ROOT/runpod/watchdog.sh" </dev/null >>"$OUT/logs/watchdog.log" 2>&1 &
+    PILOT_WATCH_JOB=1 setsid bash "$ROOT/runpod/watchdog.sh" </dev/null >>"$OUT/logs/watchdog.log" 2>&1 &
     echo $! > /tmp/pilot-watchdog.pid
   fi
   if [[ -n "${PILOT_PULL_TOKEN:-}" ]]; then

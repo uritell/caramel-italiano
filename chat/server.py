@@ -565,6 +565,45 @@ def settings_from_env() -> dict:
     }
 
 
+def check_export(model_dir: Path) -> None:
+    """Fail if config.json or the safetensors do not match this architecture.
+
+    Config.from_dict drops unknown keys and fills defaults for missing ones.
+    That would load a warmstart export quietly with the wrong delays or width.
+    """
+    root = HERE.parent
+    sys.path.insert(0, str(root / "third_party" / "caramel"))
+    import torch
+    from model import Caramel, Config
+    from safetensors import safe_open
+
+    raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    fields = set(Config.__dataclass_fields__)
+    missing = sorted(fields - set(raw))
+    extra = sorted(set(raw) - fields)
+    if missing or extra:
+        raise SystemExit(f"config.json missing={missing} unexpected={extra}")
+    cfg = Config(**{k: raw[k] for k in fields})
+    weights = model_dir / "model.safetensors"
+    with safe_open(str(weights), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        dtypes = sorted({str(handle.get_slice(k).get_dtype()) for k in keys})
+    with torch.device("meta"):
+        expect = set(Caramel(cfg).state_dict())
+    miss = sorted(expect - keys)
+    unexpected = sorted(keys - expect)
+    if miss or unexpected:
+        raise SystemExit(
+            f"safetensors missing={miss[:12]} unexpected={unexpected[:12]} "
+            f"(missing {len(miss)}, unexpected {len(unexpected)})"
+        )
+    print(
+        f"export ok: {len(keys)} tensors dtypes={dtypes} "
+        f"card={cfg.card} delays={list(cfg.delays)[:8]}",
+        flush=True,
+    )
+
+
 def load_live(model_dir: Path) -> LiveLoop:
     root = HERE.parent
     sys.path.insert(0, str(root / "third_party" / "caramel"))
@@ -572,6 +611,7 @@ def load_live(model_dir: Path) -> LiveLoop:
     from model import load
     from transformers import MimiModel
 
+    check_export(model_dir)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = load(str(model_dir), dev)
     mimi = MimiModel.from_pretrained("kyutai/mimi").to(dev).eval()

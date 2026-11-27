@@ -113,6 +113,40 @@ self_test() {
     echo "watchdog self-test failed: a finished job inside the grace must stay up" >&2
     exit 1
   fi
+  # $1.50 at $12/h trips at 448 s (about 7.5 min). That is what a chat
+  # pod does if it is billed like the pilot H100 cap instead of an A40.
+  if ! cap_due 448 1200 3600 150; then
+    echo "watchdog self-test failed: \$1.50 at \$12/h should trip at 448s" >&2
+    exit 1
+  fi
+  if cap_due 447 1200 3600 150; then
+    echo "watchdog self-test failed: \$1.50 at \$12/h tripped a second early" >&2
+    exit 1
+  fi
+  if cap_due 450 59 3600 150; then
+    echo "watchdog self-test failed: an A40 at \$0.59/h must not hit a \$1.50 cap in 7.5 min" >&2
+    exit 1
+  fi
+  saved_job="${PILOT_WATCH_JOB:-}"
+  unset PILOT_WATCH_JOB
+  if should_end_job 600 600; then
+    echo "watchdog self-test failed: a chat pod must not self-terminate on DONE" >&2
+    exit 1
+  fi
+  PILOT_WATCH_JOB=1
+  if ! should_end_job 600 600; then
+    echo "watchdog self-test failed: a training pod must self-terminate after the grace" >&2
+    exit 1
+  fi
+  if should_end_job 599 600; then
+    echo "watchdog self-test failed: a training pod inside the grace must stay up" >&2
+    exit 1
+  fi
+  if [[ -n "$saved_job" ]]; then
+    PILOT_WATCH_JOB="$saved_job"
+  else
+    unset PILOT_WATCH_JOB
+  fi
   echo "watchdog ok (bash)"
 }
 
@@ -120,6 +154,13 @@ job_grace_elapsed() {
   # $1 seconds since DONE or FAILED, $2 pull grace seconds.
   local age="$1" grace="$2"
   (( age >= grace ))
+}
+
+should_end_job() {
+  # Training pods set PILOT_WATCH_JOB=1. A chat pod must not inherit this:
+  # a stray DONE file, or the pull grace, would delete the GPU with no
+  # terminate line in the launcher log.
+  [[ "${PILOT_WATCH_JOB:-}" == 1 ]] && job_grace_elapsed "$1" "$2"
 }
 
 flush_artifacts() {
@@ -204,7 +245,7 @@ while true; do
     mtime=$(stat -c %Y "$mark" 2>/dev/null || echo "$now")
     age=$((now - mtime))
     if (( age < 0 )); then age=0; fi
-    if job_grace_elapsed "$age" "$grace"; then
+    if should_end_job "$age" "$grace"; then
       echo "watchdog job finished ${age}s ago (grace ${grace}s); terminating"
       terminate_pod && exit 0
       sleep 15
