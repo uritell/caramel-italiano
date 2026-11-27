@@ -16,18 +16,23 @@ import urllib.request
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 REST_BASE = "https://api.runpod.io/v2"
 
-# Selection used after create. No apiKey, no env (those echo secrets).
-POD_CORE = """
+# Fields a normal account key can read. Host inventory and daemon fields
+# (availableGpuCount, availableGpuCounts, maxUnreservedGpuCount, rentedCount,
+# pool ids, datacenter stock) need CSR_READ / HOST_DAEMON and are not selected.
+# Pod selections also omit apiKey, env, and volumeKey.
+POD_MACHINE = "podHostId gpuDisplayName secureCloud currentPricePerGpu"
+
+POD_CORE = f"""
 id
 desiredStatus
 costPerHr
 gpuCount
 imageName
 machineId
-machine { podHostId gpuDisplayName secureCloud currentPricePerGpu }
+machine {{ {POD_MACHINE} }}
 """.strip()
 
-POD_STATUS = """
+POD_STATUS = f"""
 id
 name
 desiredStatus
@@ -36,11 +41,11 @@ gpuCount
 imageName
 lastStatusChange
 ports
-runtime {
+runtime {{
   uptimeInSeconds
-  ports { ip isIpPublic privatePort publicPort type }
-}
-machine { podHostId gpuDisplayName secureCloud currentPricePerGpu }
+  ports {{ ip isIpPublic privatePort publicPort type }}
+}}
+machine {{ {POD_MACHINE} }}
 """.strip()
 
 CREATE = """
@@ -72,31 +77,49 @@ mutation TerminatePod($input: PodTerminateInput!) {
 }
 """
 
+# securePrice is the catalog rate. lowestPrice.uninterruptablePrice and
+# stockStatus are the same public fields the RunPod user docs select.
+# Live stock counts are not requested.
 GPU_QUOTE = """
 query GpuQuote($id: String!) {
   gpuTypes(input: { id: $id }) {
     id
     displayName
+    memoryInGb
     secureCloud
+    communityCloud
     securePrice
     maxGpuCountSecureCloud
-    memoryInGb
     lowestPrice(input: { gpuCount: 2, secureCloud: true, minCudaVersion: "12.8" }) {
       uninterruptablePrice
       stockStatus
-      maxGpuCount
-      availableGpuCount
     }
   }
 }
 """
+
+# If a future field under this query is rejected, the quote still stands
+# when securePrice came back. An error on securePrice itself does not.
+_HOST_ONLY_FIELDS = (
+    "availableGpuCount",
+    "availableGpuCounts",
+    "maxUnreservedGpuCount",
+    "rentedCount",
+    "totalCount",
+    "rentalPercentage",
+    "nodeGroupDatacenters",
+    "nodeGroupGpuSizes",
+    "gpuTypeDatacenters",
+    "defaultQuotaAbsolute",
+)
 
 
 class ApiError(RuntimeError):
     pass
 
 
-def graphql(query: str, variables: dict, api_key: str, timeout: int = 90) -> dict:
+def graphql_payload(query: str, variables: dict, api_key: str, timeout: int = 90) -> dict:
+    """POST one GraphQL document. HTTP failures raise. Field errors stay in the body."""
     body = json.dumps({"query": query, "variables": variables}).encode()
     req = urllib.request.Request(
         GRAPHQL_URL,
@@ -117,11 +140,62 @@ def graphql(query: str, variables: dict, api_key: str, timeout: int = 90) -> dic
         raise ApiError(f"GraphQL HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(f"GraphQL request failed: {exc.reason}") from exc
+    if not isinstance(payload, dict):
+        raise ApiError("GraphQL response was not an object")
+    return payload
+
+
+def graphql(query: str, variables: dict, api_key: str, timeout: int = 90) -> dict:
+    payload = graphql_payload(query, variables, api_key, timeout=timeout)
     if payload.get("errors"):
         raise ApiError("GraphQL errors: " + json.dumps(payload["errors"])[:800])
     if "data" not in payload:
         raise ApiError("GraphQL response had no data")
     return payload["data"]
+
+
+def _secure_price(quote: dict):
+    price = quote.get("securePrice")
+    if isinstance(price, (int, float)) and not isinstance(price, bool) and price > 0:
+        return price
+    return None
+
+
+def _quote_errors_optional(errors) -> bool:
+    """True when every error is a gpuTypes field other than securePrice."""
+    if not isinstance(errors, list) or not errors:
+        return False
+    for err in errors:
+        if not isinstance(err, dict):
+            return False
+        path = err.get("path") or []
+        if not path or path[0] != "gpuTypes":
+            return False
+        if "securePrice" in path:
+            return False
+    return True
+
+
+def quote_from_payload(payload: dict) -> tuple[dict, list]:
+    """Return (gpu type, optional field errors).
+
+    A field error is ignored only when securePrice is present in the same
+    payload and the error path is some other gpuTypes field. Missing
+    securePrice, or an error on securePrice, is fatal.
+    """
+    if not isinstance(payload, dict):
+        raise ApiError("GraphQL quote payload was not an object")
+    data = payload.get("data") or {}
+    types = data.get("gpuTypes") if isinstance(data, dict) else None
+    quote = types[0] if isinstance(types, list) and types else {}
+    if not isinstance(quote, dict):
+        quote = {}
+    errors = payload.get("errors") or []
+    if not errors:
+        return quote, []
+    if _secure_price(quote) is not None and _quote_errors_optional(errors):
+        return quote, errors
+    raise ApiError("GraphQL errors: " + json.dumps(errors)[:800])
 
 
 def _rest(method: str, path: str, api_key: str, payload: dict | None = None, timeout: int = 90):
@@ -194,9 +268,12 @@ def terminate_pod(pod_id: str, api_key: str) -> dict:
 
 
 def quote_gpu(gpu_id: str, api_key: str) -> dict:
-    data = graphql(GPU_QUOTE, {"id": gpu_id}, api_key)
-    types = data.get("gpuTypes") or []
-    return types[0] if types else {}
+    payload = graphql_payload(GPU_QUOTE, {"id": gpu_id}, api_key)
+    quote, optional = quote_from_payload(payload)
+    for err in optional:
+        path = ".".join(str(part) for part in (err.get("path") or []))
+        print(f"quote ignored optional field error at {path or 'unknown'}", flush=True)
+    return quote
 
 
 def _rest_create_body(pod_input: dict) -> dict:
