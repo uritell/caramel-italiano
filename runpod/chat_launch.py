@@ -75,7 +75,10 @@ def container_script(raw_url: str) -> str:
     )
 
 
-def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str, wall_s: int, cap_cents: int) -> list[dict]:
+def build_env(
+    hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str, wall_s: int, cap_cents: int,
+    temp: float = 0.75, top_k: int = 25, vad_rms: float = 0.02, hangover_ms: int = 500, gate: bool = True,
+) -> list[dict]:
     env = {
         "PILOT_BILLING_EPOCH": str(billing_epoch),
         "PILOT_MAX_SECONDS": str(wall_s),
@@ -90,6 +93,11 @@ def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, 
         "HF_HOME": "/workspace/chat-hf",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "PYTHONUNBUFFERED": "1",
+        "CHAT_TEMP": str(temp),
+        "CHAT_TOP_K": str(int(top_k)),
+        "CHAT_VAD_RMS": str(vad_rms),
+        "CHAT_HANGOVER_MS": str(int(hangover_ms)),
+        "CHAT_GATE": "1" if gate else "0",
     }
     # The pod-scoped RUNPOD_API_KEY is injected by RunPod. Do not copy the user's key.
     return [{"key": k, "value": v} for k, v in env.items()]
@@ -105,6 +113,11 @@ def build_create_input(
     wall_s: int,
     cap_cents: int,
     datacenters: tuple[str, ...] = EU_DATACENTERS,
+    temp: float = 0.75,
+    top_k: int = 25,
+    vad_rms: float = 0.02,
+    hangover_ms: int = 500,
+    gate: bool = True,
 ) -> dict:
     deadline = datetime.fromtimestamp(billing_epoch + wall_s, tz=timezone.utc)
     body = {
@@ -124,7 +137,10 @@ def build_create_input(
         "supportPublicIp": True,
         "dockerArgs": docker_args_json(container_script(chat_bootstrap_url(repo_url, repo_ref))),
         "terminateAfter": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref, wall_s, cap_cents),
+        "env": build_env(
+            hourly_cents, billing_epoch, token, repo_url, repo_ref, wall_s, cap_cents,
+            temp, top_k, vad_rms, hangover_ms, gate,
+        ),
     }
     if datacenters:
         body["dataCenterIds"] = list(datacenters)
@@ -318,10 +334,17 @@ def _check_model_dir(path: Path | None, required: bool) -> str | None:
     return None
 
 
-def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path | None, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
+def dry_run(
+    minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path | None,
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES, temp: float = 0.75, top_k: int = 25,
+    vad_rms: float = 0.02, hangover_ms: int = 500, gate: bool = True,
+) -> int:
     wall_s = minutes * 60
     epoch = int(time.time())
-    body = build_create_input(CANDIDATES[0][0], CANDIDATES[0][1], epoch, "dry-run-token", repo_url, repo_ref, wall_s, cap_cents)
+    body = build_create_input(
+        CANDIDATES[0][0], CANDIDATES[0][1], epoch, "dry-run-token", repo_url, repo_ref, wall_s, cap_cents,
+        temp=temp, top_k=top_k, vad_rms=vad_rms, hangover_ms=hangover_ms, gate=gate,
+    )
     problems = validate(body, wall_s, cap_cents)
     model_problem = _check_model_dir(model_dir, required=False)
     half_hour = cost.cost_cents(30 * 60, CANDIDATES[0][1])
@@ -335,6 +358,7 @@ def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_di
     print(f"stop: {minutes} min or {cost.format_usd(cap_cents)}, whichever first, plus RunPod terminateAfter")
     print(f"30 min on the A40 check price is {cost.format_usd(half_hour)}")
     print(f"upload chunks: {chunk_bytes // (1024 * 1024)} MB through the proxy, stop on HTTP 4xx")
+    print(f"voice: temp {temp} top_k {top_k} gate {'on' if gate else 'off'} hangover {hangover_ms} ms")
     print("the user's RUNPOD_API_KEY is not put in the pod env")
     if model_problem and model_dir is not None:
         problems.append(model_problem)
@@ -352,7 +376,11 @@ def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_di
     return 0
 
 
-def launch(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
+def launch(
+    minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path,
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES, temp: float = 0.75, top_k: int = 25,
+    vad_rms: float = 0.02, hangover_ms: int = 500, gate: bool = True,
+) -> int:
     import secrets
 
     problem = _check_model_dir(model_dir, required=True)
@@ -375,7 +403,10 @@ def launch(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir
     token = secrets.token_urlsafe(24)
     epoch = int(time.time())
     wall_s = minutes * 60
-    body = build_create_input(gpu_id, hourly, epoch, token, repo_url, repo_ref, wall_s, cap_cents)
+    body = build_create_input(
+        gpu_id, hourly, epoch, token, repo_url, repo_ref, wall_s, cap_cents,
+        temp=temp, top_k=top_k, vad_rms=vad_rms, hangover_ms=hangover_ms, gate=gate,
+    )
     problems = validate(body, wall_s, cap_cents)
     if problems:
         print("refusing to create:")
@@ -409,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo-ref", default=os.environ.get("CARAMEL_REPO_REF", "main"))
     p.add_argument("--chunk-mb", type=int, default=int(os.environ.get("CHAT_UPLOAD_CHUNK_MB", "32")),
                    help="upload piece size in MB, 1..50 (default 32)")
+    p.add_argument("--temp", type=float, default=float(os.environ.get("CHAT_TEMP", "0.75")))
+    p.add_argument("--top-k", type=int, default=int(os.environ.get("CHAT_TOP_K", "25")))
+    p.add_argument("--vad-rms", type=float, default=float(os.environ.get("CHAT_VAD_RMS", "0.02")))
+    p.add_argument("--hangover-ms", type=int, default=int(os.environ.get("CHAT_HANGOVER_MS", "500")))
+    p.add_argument("--no-gate", action="store_true", help="let the model talk while the person is speaking")
     args = p.parse_args(argv)
     if args.minutes > MAX_MINUTES or args.minutes < 1:
         print(f"--minutes must be 1..{MAX_MINUTES}")
@@ -422,8 +458,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.model_dir is None:
             print("--launch needs --model-dir")
             return 1
-        return launch(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes)
-    return dry_run(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes)
+        return launch(
+            args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes,
+            args.temp, args.top_k, args.vad_rms, args.hangover_ms, not args.no_gate,
+        )
+    return dry_run(
+        args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes,
+        args.temp, args.top_k, args.vad_rms, args.hangover_ms, not args.no_gate,
+    )
 
 
 if __name__ == "__main__":

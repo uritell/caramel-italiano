@@ -248,6 +248,9 @@ class ChatServer:
                 result = await asyncio.to_thread(self.on_terminate, "stop button")
                 await self._send(writer, 200, json.dumps(result).encode(), "application/json")
                 return
+            if method == "POST" and route == "/settings":
+                await self._settings(writer, body)
+                return
             if method == "POST" and route == "/frame":
                 await self._frame_http(writer, body)
                 return
@@ -411,6 +414,19 @@ class ChatServer:
         self.touch()
         await self._send(writer, 200, b'{"ok":true}', "application/json")
 
+    async def _settings(self, writer, body: bytes) -> None:
+        if self.loop is None:
+            await self._send(writer, 503, b"model not loaded", "text/plain")
+            return
+        try:
+            msg = json.loads(body.decode() or "{}")
+        except json.JSONDecodeError:
+            await self._send(writer, 400, b"settings must be JSON", "text/plain")
+            return
+        applied = self.loop.set_sampling(**_setting_kwargs(msg))
+        self.touch()
+        await self._send(writer, 200, json.dumps(applied).encode(), "application/json")
+
     async def _frame_http(self, writer, body: bytes) -> None:
         if self.loop is None:
             await self._send(writer, 503, b"model not loaded", "text/plain")
@@ -465,7 +481,15 @@ class ChatServer:
                     await writer.drain()
                     continue
                 if opcode == 1:
-                    samples = i16_to_f32(base64.b64decode(json.loads(data.decode())["pcm_b64"]))
+                    msg = json.loads(data.decode() or "{}")
+                    if any(key in msg for key in ("settings", "temp", "top_k", "gate")):
+                        if self.loop is None:
+                            await _send_text(writer, {"status": "The model is still loading."})
+                            continue
+                        applied = self.loop.set_sampling(**_setting_kwargs(msg))
+                        await _send_text(writer, {"status": "Updated.", **applied, "samples": 0, "ms": 0, "minutes_left": 4, "reset": False})
+                        continue
+                    samples = i16_to_f32(base64.b64decode(msg["pcm_b64"]))
                 elif opcode == 2:
                     samples = i16_to_f32(data)
                 else:
@@ -520,6 +544,27 @@ def _ws_frame(opcode: int, data: bytes) -> bytes:
     return hdr + data
 
 
+def _setting_kwargs(msg: dict) -> dict:
+    if isinstance(msg.get("settings"), dict):
+        msg = msg["settings"]
+    out = {}
+    for key in ("temp", "top_k", "gate", "vad_rms", "hangover_ms"):
+        if key in msg and msg[key] is not None:
+            out[key] = msg[key]
+    return out
+
+
+def settings_from_env() -> dict:
+    gate = os.environ.get("CHAT_GATE", "1").strip().lower() not in {"0", "false", "off", "no"}
+    return {
+        "temp": float(os.environ.get("CHAT_TEMP", "0.75")),
+        "top_k": int(os.environ.get("CHAT_TOP_K", "25")),
+        "vad_rms": float(os.environ.get("CHAT_VAD_RMS", "0.02")),
+        "hangover_ms": int(os.environ.get("CHAT_HANGOVER_MS", "500")),
+        "gate": gate,
+    }
+
+
 def load_live(model_dir: Path) -> LiveLoop:
     root = HERE.parent
     sys.path.insert(0, str(root / "third_party" / "caramel"))
@@ -530,7 +575,7 @@ def load_live(model_dir: Path) -> LiveLoop:
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = load(str(model_dir), dev)
     mimi = MimiModel.from_pretrained("kyutai/mimi").to(dev).eval()
-    return LiveLoop(model, mimi)
+    return LiveLoop(model, mimi, **settings_from_env())
 
 
 async def serve(chat: ChatServer, host: str, port: int):
