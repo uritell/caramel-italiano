@@ -115,11 +115,13 @@ Budget cap: **USD 50**. No rental without a quote and a yes.
    documented in `tokenize/README.md`. `verify_store.py` imports
    upstream `TokenStore` rather than copying it.
 6. **Train (`train/`).** Run the three upstream stages with
-   `third_party/caramel/train.py`. The one-pod pilot stops at step 401,
-   then 1072, then 1981. See `train/README.md` and `runpod/README.md`.
+   `third_party/caramel/train.py`. The full-data 2-GPU plan stops at
+   step 401, then 1072, then 1981. The one-GPU retry (100 h mono, 80 h
+   synthetic stereo, the DataHive sample) stops at 156, then 622, then
+   1254. See `train/README.md` and `runpod/README.md`.
    `python runpod/launch.py --dry-run` checks the plan and creates
    nothing. `python runpod/launch.py --launch` is the command that rents
-   one 2× H100 SXM pod, capped at 2.5 h or about $22. On-demand price
+   one H100 SXM pod, capped at 2.5 h or $12. On-demand price
    checks from the planning pass (USD, before tax, 27 Nov 2026): about
    $1.73/h (Vast.ai verified offer), $4.39/h (RunPod H100), $4.89/h
    (Lambda H100). The author's full caramel-1 run was about 4 H100

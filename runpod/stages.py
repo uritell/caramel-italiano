@@ -1,10 +1,8 @@
-"""The three upstream train.py invocations for this pilot.
+"""The three upstream train.py invocations for the one-GPU retry.
 
-Step ends, warmups, and the stage-3 eval stride are the ones derived in
-train/README.md from the measured Italian hours: stage 1 stops at 401
-(warmup 2) on 1 GPU, stage 2 runs on to 1072, and stage 3 to 1981
-(warmup 8, eval every 100) on 2 GPUs. Stages 1 and 2 share one cosine
-schedule that ends at step 1072. Stage 3 restarts it there at lr 1.5e-4.
+All three stages use one GPU. Step counts come from pilot_config.py: the
+same pass targets as the 2-GPU plan, on 100 h of mono and about 83 h of
+stereo, so they are not 401 / 1072 / 1981.
 """
 from __future__ import annotations
 
@@ -16,13 +14,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-S1_STOP = 401
-S1_WARMUP = 2
-S2_END = 1072
-S3_END = 1981
-S3_WARMUP = 8
+from pilot_config import plan as _plan
+
+_P = _plan()
+S1_STOP = _P["s1_stop"]
+S1_WARMUP = _P["s1_warmup"]
+S2_END = _P["s2_end"]
+S3_END = _P["s3_end"]
+S3_WARMUP = _P["s3_warmup"]
 S3_LR = "1.5e-4"
-S3_EVAL_EVERY = 100
+S3_EVAL_EVERY = _P["eval_every"]
 S3_PATIENCE = 2
 
 # Tiny network for the CPU smoke test only. The rented run does not pass --cfg.
@@ -45,30 +46,27 @@ def _torchrun(py: str, nproc: int) -> list[str]:
     return [py, "-m", "torch.distributed.run", "--nproc_per_node", str(nproc)]
 
 
+def _one_gpu(py: str, extra: list[str], out: Path) -> list[str]:
+    return [py, "train.py", *extra, "--workers", "4", "--out", str(out)]
+
+
 def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> list[tuple[str, list[str], dict[str, str]]]:
-    """(name, argv, extra env) for the three GPU stages. cwd is caramel/."""
+    """(name, argv, extra env). Every stage is one process on GPU 0."""
     s1, s2, s3 = runs / "s1", runs / "s2", runs / "s3"
-    common = ["--workers", "6"]
-    stage1 = [
-        py, "train.py",
+    pin = {"CUDA_VISIBLE_DEVICES": "0"}
+    stage1 = _one_gpu(py, [
         "--data", str(mono),
         "--steps", str(S2_END),
         "--stop_at", str(S1_STOP),
         "--warmup", str(S1_WARMUP),
-        *common,
-        "--out", str(s1),
-    ]
-    stage2 = [
-        *_torchrun(py, 2), "train.py",
+    ], s1)
+    stage2 = _one_gpu(py, [
         "--data", str(stereo), str(mono),
         "--weights", "0.8", "0.2",
         "--steps", str(S2_END),
         "--resume", str(s1 / "ckpt.pt"),
-        *common,
-        "--out", str(s2),
-    ]
-    stage3 = [
-        *_torchrun(py, 2), "train.py",
+    ], s2)
+    stage3 = _one_gpu(py, [
         "--data", str(stereo), str(mono),
         "--weights", "0.8", "0.2",
         "--steps", str(S3_END),
@@ -80,15 +78,8 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
         "--eval_every", str(S3_EVAL_EVERY),
         "--patience", str(S3_PATIENCE),
         "--save_best",
-        *common,
-        "--out", str(s3),
-    ]
-    # Stage 1 is one GPU. The pod still has two; the idle one is billed.
-    return [
-        ("s1", stage1, {"CUDA_VISIBLE_DEVICES": "0"}),
-        ("s2", stage2, {}),
-        ("s3", stage3, {}),
-    ]
+    ], s3)
+    return [("s1", stage1, pin), ("s2", stage2, pin), ("s3", stage3, pin)]
 
 
 def cpu_smoke_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> list[tuple[str, list[str], dict[str, str]]]:
@@ -146,12 +137,11 @@ def assert_full_numbers(commands) -> None:
     ):
         if needle not in blob:
             raise SystemExit(f"pilot command is missing {needle}")
-    if commands[0][2].get("CUDA_VISIBLE_DEVICES") != "0":
-        raise SystemExit("stage 1 must be pinned to one GPU")
-    if "--nproc_per_node" not in " ".join(commands[1][1][:4]):
-        raise SystemExit("stage 2 must launch two processes")
-    if "--nproc_per_node" not in " ".join(commands[2][1][:4]):
-        raise SystemExit("stage 3 must launch two processes")
+    for name, argv, env in commands:
+        if env.get("CUDA_VISIBLE_DEVICES") != "0":
+            raise SystemExit(f"{name} must be pinned to one GPU")
+        if "--nproc_per_node" in argv or "torch.distributed.run" in argv:
+            raise SystemExit(f"{name} must not launch a second GPU")
 
 
 def run_commands(commands, cwd: Path, log_dir: Path) -> None:
@@ -171,6 +161,16 @@ def run_commands(commands, cwd: Path, log_dir: Path) -> None:
             print(tail, flush=True)
         if proc.returncode != 0:
             raise SystemExit(f"{name} exited {proc.returncode}; see {log_path}")
+        publish = os.environ.get("PILOT_OUT")
+        if publish:
+            out_dir = Path(argv[argv.index("--out") + 1])
+            dest = Path(publish) / "checkpoints" / name
+            dest.mkdir(parents=True, exist_ok=True)
+            for fname in ("ckpt.pt", "best.pt"):
+                src = out_dir / fname
+                if src.is_file():
+                    shutil.copy2(src, dest / fname)
+                    print(f"published {name}/{fname}", flush=True)
 
 
 def main(argv: list[str]) -> int:

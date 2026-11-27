@@ -21,12 +21,15 @@ else
   echo "PUBLIC_KEY unset; scp pull needs the HTTP port instead" | tee -a /workspace/pilot-out/logs/bootstrap.log
 fi
 
-sed -n '/^# BEGIN WATCHDOG$/,/^# END WATCHDOG$/p' "$0" | sed '1d;$d' > /tmp/pilot-watchdog.sh
+{
+  echo '#!/bin/bash'
+  sed -n '/^# BEGIN WATCHDOG$/,/^# END WATCHDOG$/p' "$0" | sed '1d;$d'
+} > /tmp/pilot-watchdog.sh
 chmod +x /tmp/pilot-watchdog.sh
 if command -v setsid >/dev/null 2>&1; then
-  setsid /tmp/pilot-watchdog.sh </dev/null >>/workspace/pilot-out/logs/watchdog.log 2>&1 &
+  setsid bash /tmp/pilot-watchdog.sh </dev/null >>/workspace/pilot-out/logs/watchdog.log 2>&1 &
 else
-  nohup /tmp/pilot-watchdog.sh </dev/null >>/workspace/pilot-out/logs/watchdog.log 2>&1 &
+  nohup bash /tmp/pilot-watchdog.sh </dev/null >>/workspace/pilot-out/logs/watchdog.log 2>&1 &
 fi
 echo $! > /tmp/pilot-watchdog.pid
 
@@ -126,6 +129,29 @@ stop_pod() {
     -d '{"action":"stop"}'
 }
 
+cap_due() {
+  # $1 elapsed seconds, $2 hourly cents, $3 wall seconds, $4 max cents
+  local elapsed="$1" hourly="$2" max_s="$3" max_cents="$4"
+  local cost=$(( (elapsed * hourly + 3599) / 3600 ))
+  if (( elapsed >= max_s || cost >= max_cents )); then
+    return 0
+  fi
+  return 1
+}
+
+self_test() {
+  # Fake clocks. 2.5 h at $4.39 must trip. One minute must not.
+  if ! cap_due 9000 439 9000 1200; then
+    echo "watchdog self-test failed: 2.5h should trip the cap" >&2
+    exit 1
+  fi
+  if cap_due 60 439 9000 1200; then
+    echo "watchdog self-test failed: 60s should not trip the cap" >&2
+    exit 1
+  fi
+  echo "watchdog ok (bash)"
+}
+
 if [[ "${1:-}" == "--once" ]]; then
   terminate_pod
   exit $?
@@ -134,11 +160,16 @@ if [[ "${1:-}" == "--stop" ]]; then
   stop_pod
   exit $?
 fi
+if [[ "${1:-}" == "--self-test" ]]; then
+  self_test
+  exit 0
+fi
+self_test
 
 start="${PILOT_BILLING_EPOCH:-$(date +%s)}"
 max_s="${PILOT_MAX_SECONDS:-9000}"
-max_cents="${PILOT_MAX_USD_CENTS:-2200}"
-hourly="${PILOT_HOURLY_CENTS:-878}"
+max_cents="${PILOT_MAX_USD_CENTS:-1200}"
+hourly="${PILOT_HOURLY_CENTS:-439}"
 echo "watchdog armed start=${start} wall=${max_s}s cap_cents=${max_cents} hourly_cents=${hourly}"
 while true; do
   now=$(date +%s)
@@ -148,7 +179,7 @@ while true; do
   cost=$(( (elapsed * hourly + 3599) / 3600 ))
   printf 'watchdog elapsed=%ss cost_cents=%s cap_cents=%s wall_s=%s\n' \
     "$elapsed" "$cost" "$max_cents" "$max_s"
-  if (( elapsed >= max_s || cost >= max_cents )); then
+  if cap_due "$elapsed" "$hourly" "$max_s" "$max_cents"; then
     echo "watchdog cap reached"
     terminate_pod && exit 0
     sleep 15

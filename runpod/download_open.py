@@ -296,6 +296,7 @@ def download(
     sources: list[str],
     max_audio_s: float,
     max_bytes: int,
+    max_mono_s: float = 0.0,
     fleurs_splits: tuple[str, ...] = FLEURS_SPLITS,
 ) -> list[dict]:
     for name in sources:
@@ -306,26 +307,41 @@ def download(
             )
     out.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
-    if "mls_it" in sources:
-        records += stream_audio(
+    mono_left = max_mono_s
+
+    def mono_cap() -> float:
+        if mono_left > 0:
+            return mono_left
+        return max_audio_s
+
+    if "mls_it" in sources and mono_cap() != 0:
+        got = stream_audio(
             MLS_URL, out / "mls",
             source="mls_it", split="italian",
-            max_audio_s=max_audio_s, max_bytes=max_bytes,
+            max_audio_s=mono_cap(), max_bytes=max_bytes,
             speaker_from_name=_mls_speaker,
         )
-    if "fleurs_it" in sources:
-        splits = ("test",) if max_audio_s > 0 else fleurs_splits
+        records += got
+        if mono_left > 0:
+            mono_left -= sum(r["duration_s"] for r in got)
+    if "fleurs_it" in sources and mono_cap() != 0:
+        splits = ("test",) if (max_audio_s > 0 and max_mono_s <= 0) else fleurs_splits
         for split in splits:
+            if mono_left < 0:
+                break
             url = (
                 "https://huggingface.co/datasets/google/fleurs/resolve/main/"
                 f"data/it_it/audio/{split}.tar.gz"
             )
-            records += stream_audio(
+            got = stream_audio(
                 url, out / "fleurs" / split,
                 source="fleurs_it", split=split,
-                max_audio_s=max_audio_s, max_bytes=max_bytes,
+                max_audio_s=mono_cap(), max_bytes=max_bytes,
                 speaker_from_name=_fleurs_speaker,
             )
+            records += got
+            if mono_left > 0:
+                mono_left -= sum(r["duration_s"] for r in got)
     if "datahive" in sources:
         records += download_datahive(out / "datahive", max_audio_s)
     manifest = out / "manifest.jsonl"
@@ -348,6 +364,8 @@ def main(argv: list[str]) -> int:
                    help="stop each source after this many seconds; 0 downloads the source")
     p.add_argument("--max-bytes", type=int, default=0,
                    help="stop a tar stream after this many bytes; 0 means the whole file")
+    p.add_argument("--max-mono-hours", type=float, default=0.0,
+                   help="stop MLS+FLEURS once this many hours are saved; DataHive is always complete")
     p.add_argument("--head", action="store_true", help="HEAD the public URLs and exit")
     args = p.parse_args(argv)
     if args.head:
@@ -362,6 +380,7 @@ def main(argv: list[str]) -> int:
         sources=args.source or ["mls_it", "fleurs_it", "datahive"],
         max_audio_s=args.max_audio_s,
         max_bytes=args.max_bytes,
+        max_mono_s=args.max_mono_hours * 3600.0,
     )
     return 0
 

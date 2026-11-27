@@ -45,9 +45,63 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _restore_path(self, rel: str) -> Path | None:
+        rel = rel.lstrip("/")
+        parts = Path(rel).parts
+        if not parts or ".." in parts:
+            return None
+        if parts[0] not in ("stores", "checkpoints"):
+            return None
+        path = (ROOT / "restore" / rel).resolve()
+        try:
+            path.relative_to((ROOT / "restore").resolve())
+        except ValueError:
+            return None
+        return path
+
+    def _upload(self) -> None:
+        rel = self.headers.get("X-Pilot-Path") or ""
+        path = self._restore_path(rel)
+        if path is None:
+            self.send_error(400)
+            return
+        length = int(self.headers.get("Content-Length") or "0")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        remaining = length
+        with path.open("wb") as fh:
+            while remaining > 0:
+                chunk = self.rfile.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                remaining -= len(chunk)
+        self._json(200, {"ok": True, "bytes": length - remaining, "path": rel})
+
     def _ack(self) -> None:
+        # Routine pulls must not create PULLED. Only an ack after DONE or
+        # FAILED, and only if it is newer than that file, ends the wait.
+        marks = [p for p in (ROOT / "DONE", ROOT / "FAILED") if p.is_file()]
+        if not marks:
+            self._json(200, {"ok": False, "reason": "no DONE or FAILED yet"})
+            return
+        newest = max(p.stat().st_mtime for p in marks)
+        if time.time() <= newest:
+            self._json(409, {"ok": False, "reason": "ack is not newer than DONE or FAILED"})
+            return
         (ROOT / "PULLED").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
         self._json(200, {"ok": True})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if self.headers.get("X-Pilot-Token") != TOKEN:
+            self._unauthorized()
+            return
+        path = self._path()
+        if path is None:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
         self._dispatch()
@@ -62,6 +116,22 @@ class Handler(BaseHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         if route in ("/ack", "/ack/"):
             self._ack()
+            return
+        if route == "/upload":
+            if self.command != "POST":
+                self.send_error(405)
+                return
+            self._upload()
+            return
+        if route == "/ready":
+            if self.command != "POST":
+                self.send_error(405)
+                return
+            (ROOT / "restore").mkdir(parents=True, exist_ok=True)
+            (ROOT / "restore" / "READY").write_text(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n"
+            )
+            self._json(200, {"ok": True})
             return
         if route in ("/", ""):
             files = []

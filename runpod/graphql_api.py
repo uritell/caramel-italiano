@@ -10,6 +10,8 @@ API on https://api.runpod.io/v2. Nothing in this file calls any other host.
 from __future__ import annotations
 
 import json
+import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -90,7 +92,7 @@ query GpuQuote($id: String!) {
     communityCloud
     securePrice
     maxGpuCountSecureCloud
-    lowestPrice(input: { gpuCount: 2, secureCloud: true, minCudaVersion: "12.8" }) {
+    lowestPrice(input: { gpuCount: 1, secureCloud: true, minCudaVersion: "12.8" }) {
       uninterruptablePrice
       stockStatus
     }
@@ -118,6 +120,28 @@ class ApiError(RuntimeError):
     pass
 
 
+def _urlopen_retry(req: urllib.request.Request, timeout: int, attempts: int = 5):
+    """Retry timeouts and TLS errors. A 4xx other than 429 is returned to the caller."""
+    delay = 2.0
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and 400 <= exc.code < 500:
+                raise
+            last = exc
+        except (TimeoutError, urllib.error.URLError, ssl.SSLError, ConnectionError, OSError) as exc:
+            last = exc
+        if attempt + 1 == attempts:
+            break
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+    if isinstance(last, urllib.error.HTTPError):
+        raise last
+    raise ApiError(f"network failed after {attempts} tries: {last}")
+
+
 def graphql_payload(query: str, variables: dict, api_key: str, timeout: int = 90) -> dict:
     """POST one GraphQL document. HTTP failures raise. Field errors stay in the body."""
     body = json.dumps({"query": query, "variables": variables}).encode()
@@ -133,7 +157,7 @@ def graphql_payload(query: str, variables: dict, api_key: str, timeout: int = 90
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_retry(req, timeout) as resp:
             payload = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:600]
@@ -212,7 +236,7 @@ def _rest(method: str, path: str, api_key: str, payload: dict | None = None, tim
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_retry(req, timeout) as resp:
             raw = resp.read().decode()
             if not raw:
                 return {}
@@ -265,6 +289,19 @@ def terminate_pod(pod_id: str, api_key: str) -> dict:
         _rest("POST", f"/pods/{pod_id}/action", api_key, {"action": "terminate"})
         return {"via": "rest"}
     return {"podTerminate": data.get("podTerminate"), "via": "graphql"}
+
+
+LIST_PODS = """
+query MyPods {
+  myself { pods { id desiredStatus } }
+}
+"""
+
+
+def list_pod_ids(api_key: str) -> list[str]:
+    data = graphql(LIST_PODS, {}, api_key)
+    pods = ((data.get("myself") or {}).get("pods")) or []
+    return [str(p.get("id")) for p in pods if isinstance(p, dict) and p.get("id")]
 
 
 def quote_gpu(gpu_id: str, api_key: str) -> dict:

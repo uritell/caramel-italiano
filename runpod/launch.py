@@ -116,9 +116,10 @@ def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, 
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "PYTHONUNBUFFERED": "1",
     }
-    key = os.environ.get("RUNPOD_API_KEY", "")
-    if key:
-        env["RUNPOD_API_KEY"] = key
+    # Do not copy the user's key into the pod. RunPod injects a pod-scoped
+    # RUNPOD_API_KEY, and that is what watchdog.sh uses to terminate.
+    if os.environ.get("PILOT_RESUME_FROM"):
+        env["PILOT_RESUME"] = "1"
     return [{"key": k, "value": v} for k, v in env.items()]
 
 
@@ -158,8 +159,10 @@ def validate_input(body: dict) -> list[str]:
     problems = []
     if body.get("cloudType") != "SECURE":
         problems.append("cloudType must be SECURE")
-    if body.get("gpuCount") != 2:
-        problems.append("gpuCount must be 2")
+    if body.get("gpuCount") != 1:
+        problems.append("gpuCount must be 1")
+    if any(item.get("key") == "RUNPOD_API_KEY" for item in body.get("env") or []):
+        problems.append("the user's RUNPOD_API_KEY must not be copied into the pod")
     if "H100" not in body.get("gpuTypeId", "") or "HBM3" not in body.get("gpuTypeId", ""):
         problems.append("gpuTypeId must be the H100 SXM (HBM3) id")
     if body.get("volumeInGb") not in (0, None):
@@ -391,6 +394,19 @@ def _pull_http_base(base: str, dest: Path, token: str) -> bool:
     for rel in files:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
+        size_hdr = None
+        try:
+            probe = urllib.request.Request(
+                base.rstrip("/") + "/" + rel,
+                method="HEAD",
+                headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"},
+            )
+            with urllib.request.urlopen(probe, timeout=30) as resp:
+                size_hdr = resp.headers.get("Content-Length")
+        except Exception:
+            size_hdr = None
+        if target.is_file() and size_hdr and target.stat().st_size == int(size_hdr):
+            continue
         data = _http_get(base.rstrip("/") + "/" + rel, token, timeout=300)
         target.write_bytes(data)
         print(f"pulled {rel} ({len(data)} bytes)", flush=True)
@@ -404,6 +420,48 @@ def _pull_http(pod: dict, dest: Path, token: str) -> bool:
         return False
     ip, port = found
     return _pull_http_base(f"http://{ip}:{port}", dest, token)
+
+
+def upload_restore(pod_id: str, token: str, src: Path) -> None:
+    """Send stores/ and checkpoints/ so the new pod can skip download and tokenize."""
+    import http.client
+    from urllib.parse import urlparse
+
+    base = proxy_base(pod_id)
+    parsed = urlparse(base)
+    sent = 0
+    for folder in ("stores", "checkpoints"):
+        root = src / folder
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(src))
+            size = path.stat().st_size
+            conn = http.client.HTTPSConnection(parsed.hostname, timeout=300)
+            with path.open("rb") as fh:
+                conn.request("POST", "/upload", body=fh, headers={
+                    "X-Pilot-Token": token,
+                    "X-Pilot-Path": rel,
+                    "Content-Length": str(size),
+                    "Content-Type": "application/octet-stream",
+                })
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            if resp.status != 200:
+                raise RuntimeError(f"upload {rel} returned {resp.status}")
+            sent += 1
+            print(f"uploaded {rel} ({size} bytes)", flush=True)
+    conn = http.client.HTTPSConnection(parsed.hostname, timeout=60)
+    conn.request("POST", "/ready", body=b"", headers={"X-Pilot-Token": token, "Content-Length": "0"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    if resp.status != 200:
+        raise RuntimeError(f"ready returned {resp.status}")
+    print(f"uploaded {sent} files and marked READY", flush=True)
 
 
 def pull_outputs(pod: dict, dest: Path, token: str, key_path: str) -> str:
@@ -435,6 +493,10 @@ def _hourly_from_pod(pod: dict, fallback: int) -> int:
     if isinstance(per, (int, float)) and per > 0:
         return cost.dollars_to_cents_up(float(per) * cost.GPU_COUNT)
     return fallback
+
+
+def _stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _status_name(pod: dict) -> str:
@@ -486,6 +548,12 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
     print(f"proxy: {proxy_base(pod_id)}/")
     print(f"outputs will land in {out_dir}")
 
+    return follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod)
+
+
+def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None) -> int:
+    if pod is None:
+        pod = {"id": pod_id}
     def terminate(reason: str) -> None:
         print(f"terminate ({reason})", flush=True)
         try:
@@ -503,11 +571,44 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
 
     best_uptime = None
     proxy_up = False
+    missing = 0
+    uploaded = False
+    resume = os.environ.get("PILOT_RESUME_FROM", "")
+    attach = {
+        "pod_id": pod_id,
+        "token": token,
+        "epoch": epoch,
+        "hourly_cents": hourly,
+        "out": str(out_dir),
+    }
+    (out_dir / "attach.json").write_text(json.dumps(attach, indent=2) + "\n")
     try:
         while True:
             time.sleep(20)
-            got = graphql_api.pod_status(pod_id, api_key)
+            try:
+                got = graphql_api.pod_status(pod_id, api_key)
+            except (graphql_api.ApiError, TimeoutError, OSError) as exc:
+                print(f"{_stamp()} status retryable error: {exc}", flush=True)
+                continue
             current = got.get("pod") or {}
+            gone = not current
+            if gone:
+                try:
+                    ids = graphql_api.list_pod_ids(api_key)
+                except (graphql_api.ApiError, TimeoutError, OSError) as exc:
+                    print(f"{_stamp()} pod list failed: {exc}", flush=True)
+                    continue
+                if pod_id in ids:
+                    missing = 0
+                    print(f"{_stamp()} status was empty but myself.pods still has {pod_id}", flush=True)
+                    continue
+                missing += 1
+                print(f"{_stamp()} pod missing {missing}/3", flush=True)
+                if missing >= 3:
+                    print(f"{_stamp()} pod {pod_id} is gone from myself.pods; not calling terminate")
+                    return 2
+                continue
+            missing = 0
             current.setdefault("id", pod_id)
             elapsed = int(time.time()) - epoch
             rate = _hourly_from_pod(current, hourly)
@@ -519,8 +620,11 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str) -> int:
                 best_uptime = uptime if best_uptime is None else max(best_uptime, uptime)
             if not proxy_up:
                 proxy_up = pull_server_answered(pod_id, token)
+            if proxy_up and resume and not uploaded:
+                upload_restore(pod_id, token, Path(resume))
+                uploaded = True
             print(
-                f"[cost] {elapsed}s  {cost.format_usd(spent)}  "
+                f"{_stamp()} [cost] {elapsed}s  {cost.format_usd(spent)}  "
                 f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  "
                 f"uptime {uptime if uptime is not None else 'none'}  "
                 f"proxy {'up' if proxy_up else 'down'}  via {got.get('via')}",
@@ -621,7 +725,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("--repo-ref", default=os.environ.get("CARAMEL_REPO_REF", "main"))
     p.add_argument("--out", type=Path, default=HERE / "retrieved")
     p.add_argument("--ssh-key", default=os.environ.get("PILOT_SSH_KEY", ""))
+    p.add_argument("--resume-from", type=Path, default=None,
+                   help="upload stores/ and checkpoints/ from this directory once the new pod answers")
     args = p.parse_args(argv)
+    if args.resume_from:
+        os.environ["PILOT_RESUME_FROM"] = str(args.resume_from)
     if args.launch and args.dry_run:
         print("Pass either --launch or --dry-run.")
         return 2

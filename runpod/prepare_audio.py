@@ -81,7 +81,7 @@ def _split_datahive(rows: list[dict], work: Path) -> dict[str, list[dict]]:
     }
 
 
-def build_dialogues(mono_rows: list[dict], dest: Path, dialogue_s: float) -> list[dict]:
+def build_dialogues(mono_rows: list[dict], dest: Path, dialogue_s: float, max_total_s: float = 0.0) -> list[dict]:
     import numpy as np
 
     queues: dict[str, list] = defaultdict(list)
@@ -104,6 +104,7 @@ def build_dialogues(mono_rows: list[dict], dest: Path, dialogue_s: float) -> lis
     made = []
     index = 0
     guard = 0
+    total_s = 0.0
     while True:
         remaining = sorted(
             ((sum(len(c["audio"]) for c in queues[s]), s) for s in speakers if queues[s]),
@@ -153,6 +154,10 @@ def build_dialogues(mono_rows: list[dict], dest: Path, dialogue_s: float) -> lis
         })
         index += 1
         guard += 1
+        total_s += made[-1]["duration_s"]
+        if max_total_s and total_s >= max_total_s:
+            print(f"synth cap {total_s:.1f}s", flush=True)
+            break
         if guard > 100000:
             break
     print(f"synth dialogues: {len(made)}", flush=True)
@@ -166,14 +171,14 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             fh.write(json.dumps(row) + "\n")
 
 
-def prepare(manifest: Path, work: Path, dialogue_s: float = DIALOGUE_S) -> dict:
+def prepare(manifest: Path, work: Path, dialogue_s: float = DIALOGUE_S, max_synth_s: float = 0.0) -> dict:
     rows = _load_manifest(manifest)
     mono = [r for r in rows if r.get("role") != "stereo" and r.get("source") != "datahive"]
     hive = [r for r in rows if r.get("source") == "datahive" or r.get("role") == "stereo"]
     # A mono file that was labelled stereo by mistake stays out of the mono store.
     mono = [r for r in mono if int(r.get("channels") or 1) == 1 or r.get("source") != "datahive"]
     real = _split_datahive(hive, work)
-    synth = build_dialogues(mono, work / "synth", dialogue_s)
+    synth = build_dialogues(mono, work / "synth", dialogue_s, max_synth_s)
     mono_out = []
     for i, row in enumerate(mono):
         audio = _as_24k(row, 1)
@@ -235,8 +240,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--work", type=Path, required=True)
     p.add_argument("--dialogue-s", type=float, default=DIALOGUE_S)
+    p.add_argument("--max-synth-hours", type=float, default=0.0)
     args = p.parse_args(argv)
-    prepare(args.manifest, args.work, args.dialogue_s)
+    prepare(args.manifest, args.work, args.dialogue_s, args.max_synth_hours * 3600.0)
     return 0
 
 
