@@ -1,13 +1,10 @@
 """The three upstream train.py invocations for this pilot.
 
-Step ends are the ones set for the pilot: stage 1 stops at 401 on 1 GPU,
-stage 2 runs on to 1072 and stage 3 to 1981, both on 2 GPUs. Stages 1 and 2
-share one cosine schedule that ends at step 1072. Stage 3 restarts it there
-with the published stage-3 peak and warmup.
-
-`--eval_every 200` is not the published 1000. A stride of 1000 never lands
-between steps 1072 and 1981, so `--save_best` would not run. 200 still
-evaluates a handful of times on this short stage.
+Step ends, warmups, and the stage-3 eval stride are the ones derived in
+train/README.md from the measured Italian hours: stage 1 stops at 401
+(warmup 2) on 1 GPU, stage 2 runs on to 1072, and stage 3 to 1981
+(warmup 8, eval every 100) on 2 GPUs. Stages 1 and 2 share one cosine
+schedule that ends at step 1072. Stage 3 restarts it there at lr 1.5e-4.
 """
 from __future__ import annotations
 
@@ -20,11 +17,12 @@ import sys
 from pathlib import Path
 
 S1_STOP = 401
+S1_WARMUP = 2
 S2_END = 1072
 S3_END = 1981
-S3_WARMUP = 200
+S3_WARMUP = 8
 S3_LR = "1.5e-4"
-S3_EVAL_EVERY = 200
+S3_EVAL_EVERY = 100
 S3_PATIENCE = 2
 
 # Tiny network for the CPU smoke test only. The rented run does not pass --cfg.
@@ -56,6 +54,7 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
         "--data", str(mono),
         "--steps", str(S2_END),
         "--stop_at", str(S1_STOP),
+        "--warmup", str(S1_WARMUP),
         *common,
         "--out", str(s1),
     ]
@@ -73,7 +72,6 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
         "--data", str(stereo), str(mono),
         "--weights", "0.8", "0.2",
         "--steps", str(S3_END),
-        "--stop_at", str(S3_END),
         "--resume", str(s2 / "ckpt.pt"),
         "--sched_start", str(S2_END),
         "--warmup", str(S3_WARMUP),
@@ -142,7 +140,10 @@ def format_commands(commands) -> str:
 
 def assert_full_numbers(commands) -> None:
     blob = " ".join(" ".join(argv) for _, argv, _ in commands)
-    for needle in (str(S1_STOP), str(S2_END), str(S3_END), "0.8", "0.2", "--save_best", "1.5e-4"):
+    for needle in (
+        str(S1_STOP), str(S2_END), str(S3_END), "0.8", "0.2", "--save_best", "1.5e-4",
+        "--warmup 2", "--warmup 8", "--eval_every 100",
+    ):
         if needle not in blob:
             raise SystemExit(f"pilot command is missing {needle}")
     if commands[0][2].get("CUDA_VISIBLE_DEVICES") != "0":

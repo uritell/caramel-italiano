@@ -1,27 +1,42 @@
-# score/ — Italian timing / closeness statistics
+# score/ — two-track timing statistics
 
-caramel-1 picked data and later judged the model with a **closeness
-score**: 13 statistics, each turned into a target band, mostly about
-conversation timing (overlap, gaps between turns, backchannels per
-minute, silence) and a few about the recording (cross-talk, noise
-floor). A score of 0 means every statistic sits inside its band.
+Energy voice activity on stereo audio, one speaker per channel. The
+headline numbers are the timing rows caramel publishes: turns per minute,
+percent both talking, percent nobody talking, median gap between turns,
+and overlapping turn changes per minute. Backchannels per minute are
+counted as well, because synthesis needs a rate.
 
-The public caramel repo **does not include** this scorer, the
-speaker-splitting tools, or the published English/Dessa band values as
-code. Those have to be rebuilt from the statistics and the tables in
-the [caramel README](https://github.com/naklecha/caramel/blob/84a9271d265841543287d4044d7ef80991a2b003/README.md).
+Upstream did not ship this scorer. The definitions are in `activity.py`.
+Short version:
 
-## What this folder should do
+- A frame is speech when its RMS sits above a threshold between the
+  channel's quiet frames and its loud frames.
+- A turn change is two successive floor turns by different speakers.
+- The gap is next start minus previous end. Negative means the next
+  person starts first.
+- An overlapping turn change is a turn change with a negative gap.
+- A backchannel is a short region that sits inside the other person's
+  speech. "Short" is the valley in the DataHive duration histogram, not
+  a fixed one-second rule.
+- Percents are fractions of the timeline. Both-talking, exactly-one, and
+  nobody-talking add up to 100%.
 
-- Re-implement the published statistics on stereo (one speaker per
-  channel) Italian audio.
-- **Fit the target bands on real Italian conversations**, not on the
-  English Dessa bands. The only clean-licence, separate-track Italian
-  conversations in the pilot are the DataHive sample (~3 hours, 6
-  conversations). Hold some of them out so the bands are not fitted on
-  the same recordings used to praise the model.
-- Use the score both as a sanity check on synthetic dialogues (expect
-  them to look unlike real Italian talk) and as an evaluation of
-  generated conversations.
+`measure.py` runs that detector on every DataHive conversation, chooses
+the VAD smoothing by a grid against DataHive's own card labels, and
+writes `synth/timing_config.json`.
 
-Implementation status: not started. Do not invent band values here.
+`score_files.py` scores any stereo wavs with that same detector, so the
+synthetic set is not scored with a different definition.
+
+`compare.py` writes `comparison.md`.
+
+```bash
+python score/activity.py --self-test
+python score/measure.py
+python score/score_files.py --audio synth/out/conversations/*.wav --out score/out/synthetic.json
+python score/compare.py --synthetic score/out/synthetic.json
+```
+
+The target bands for a full closeness score are not in this folder.
+Do not invent them. The comparison here is the five timing numbers (plus
+backchannels) on real DataHive versus the synthetic set.
