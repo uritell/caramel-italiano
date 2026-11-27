@@ -2,7 +2,8 @@
 """Download the open Italian pilot audio. No accounts.
 
 Included: Multilingual LibriSpeech Italian (OpenSLR 94), FLEURS Italian,
-and the DataHive Italian Conversations sample. All three are CC BY 4.0.
+Emozionalmente (OpenSLR 161, optional), and the DataHive Italian
+Conversations sample. All of these are CC BY 4.0.
 
 Common Voice is refused. It needs a Mozilla Data Collective account, and
 this pilot does not create one.
@@ -13,10 +14,12 @@ of minutes of audio without pulling the 15 GB MLS archive.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import tarfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 UA = "caramel-italiano-pilot/1.0"
@@ -25,6 +28,7 @@ AUDIO_EXT = {".flac", ".wav", ".mp3", ".ogg", ".opus"}
 MLS_URL = "https://dl.fbaipublicfiles.com/mls/mls_italian.tar.gz"
 FLEURS_SPLITS = ("train", "dev", "test")
 DATAHIVE_REPO = "https://huggingface.co/datasets/datahiveai/italian-conversations-sample/resolve/main/preview"
+EMO_URL = "https://zenodo.org/records/12616095/files/emozionalmente.zip"
 
 ATTRIBUTION = {
     "mls_it": (
@@ -39,6 +43,11 @@ ATTRIBUTION = {
         "Italian Conversations sample by DataHive, CC BY 4.0, "
         "https://huggingface.co/datasets/datahiveai/italian-conversations-sample. "
         "Caller is left, callee is right."
+    ),
+    "emozionalmente": (
+        "Emozionalmente (Catania, Wilke, and Garzotto, 2025), CC BY 4.0, "
+        "OpenSLR 161 and https://zenodo.org/records/12616095. "
+        "6,902 acted Italian clips, mono 16 kHz."
     ),
 }
 
@@ -123,7 +132,18 @@ def _duration(path: Path) -> float:
             return 0.0
         return float(info.frames) / float(info.samplerate)
     except Exception:
-        return 0.0
+        pass
+    if path.suffix.lower() == ".wav":
+        try:
+            import wave
+            with wave.open(str(path), "rb") as fh:
+                rate = fh.getframerate()
+                if rate <= 0:
+                    return 0.0
+                return fh.getnframes() / float(rate)
+        except Exception:
+            return 0.0
+    return 0.0
 
 
 def stream_audio(
@@ -290,6 +310,59 @@ def download_datahive(dest: Path, max_audio_s: float) -> list[dict]:
     return records
 
 
+def download_emozionalmente(dest: Path, max_audio_s: float) -> list[dict]:
+    """All of OpenSLR 161. Speaker ids come from metadata/samples.csv."""
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = dest / "emozionalmente.zip"
+    print(f"download emozionalmente {EMO_URL}", flush=True)
+    with _request(EMO_URL) as resp, archive.open("wb") as fh:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            fh.write(chunk)
+    actors: dict[str, str] = {}
+    records = []
+    audio_s = 0.0
+    with zipfile.ZipFile(archive) as zf:
+        sample_name = next(n for n in zf.namelist() if n.endswith("metadata/samples.csv"))
+        with zf.open(sample_name) as fh:
+            text = fh.read().decode("utf-8", errors="replace").splitlines()
+        for row in csv.DictReader(text):
+            actors[Path(row["file_name"]).name] = row.get("actor") or "emo_unknown"
+        for name in zf.namelist():
+            if audio_s >= max_audio_s > 0:
+                break
+            if not name.endswith(".wav") or "__MACOSX" in name:
+                continue
+            safe = Path(name).name
+            path = dest / "audio" / safe
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(zf.read(name))
+            dur = _duration(path)
+            if dur <= 0:
+                path.unlink(missing_ok=True)
+                continue
+            if max_audio_s > 0 and audio_s + dur > max_audio_s and audio_s > 0:
+                path.unlink(missing_ok=True)
+                break
+            audio_s += dur
+            records.append({
+                "source": "emozionalmente",
+                "licence": "CC BY 4.0",
+                "attribution": ATTRIBUTION["emozionalmente"],
+                "split": "all",
+                "path": str(path),
+                "duration_s": round(dur, 3),
+                "speaker_id": f"emo_{actors.get(safe, 'unknown')[:12]}",
+                "channels": 1,
+                "role": "mono",
+            })
+    archive.unlink(missing_ok=True)
+    print(f"  emozionalmente {len(records)} files, {audio_s:.1f} s", flush=True)
+    return records
+
+
 def download(
     out: Path,
     *,
@@ -314,7 +387,13 @@ def download(
             return mono_left
         return max_audio_s
 
-    if "mls_it" in sources and mono_cap() != 0:
+    def want_more() -> bool:
+        # Both caps at 0 means the whole source. A positive cap stops at 0 left.
+        if max_mono_s <= 0 and max_audio_s <= 0:
+            return True
+        return mono_cap() > 0
+
+    if "mls_it" in sources and want_more():
         got = stream_audio(
             MLS_URL, out / "mls",
             source="mls_it", split="italian",
@@ -324,7 +403,7 @@ def download(
         records += got
         if mono_left > 0:
             mono_left -= sum(r["duration_s"] for r in got)
-    if "fleurs_it" in sources and mono_cap() != 0:
+    if "fleurs_it" in sources and want_more():
         splits = ("test",) if (max_audio_s > 0 and max_mono_s <= 0) else fleurs_splits
         for split in splits:
             if mono_left < 0:
@@ -342,15 +421,19 @@ def download(
             records += got
             if mono_left > 0:
                 mono_left -= sum(r["duration_s"] for r in got)
+    if "emozionalmente" in sources and want_more():
+        got = download_emozionalmente(out / "emo", mono_cap() if max_mono_s > 0 or max_audio_s > 0 else 0.0)
+        records += got
+        if mono_left > 0:
+            mono_left -= sum(r["duration_s"] for r in got)
     if "datahive" in sources:
         records += download_datahive(out / "datahive", max_audio_s)
     manifest = out / "manifest.jsonl"
     with manifest.open("w", encoding="utf-8") as fh:
         for row in records:
             fh.write(json.dumps(row) + "\n")
-    (out / "ATTRIBUTION.txt").write_text(
-        "\n".join(ATTRIBUTION[k] for k in ("mls_it", "fleurs_it", "datahive")) + "\n"
-    )
+    names = [k for k in ("mls_it", "fleurs_it", "emozionalmente", "datahive") if k in sources]
+    (out / "ATTRIBUTION.txt").write_text("\n".join(ATTRIBUTION[k] for k in names) + "\n")
     print(f"manifest {manifest} ({len(records)} clips)", flush=True)
     return records
 
@@ -359,7 +442,7 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, help="required unless --head")
     p.add_argument("--source", action="append", default=None,
-                   choices=["mls_it", "fleurs_it", "datahive"])
+                   choices=["mls_it", "fleurs_it", "emozionalmente", "datahive"])
     p.add_argument("--max-audio-s", type=float, default=0.0,
                    help="stop each source after this many seconds; 0 downloads the source")
     p.add_argument("--max-bytes", type=int, default=0,

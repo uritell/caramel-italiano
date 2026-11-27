@@ -180,7 +180,10 @@ fi
 if [[ "$SKIP_PREP" == 0 ]]; then
 status "download open audio"
 DL_ARGS=(--out "$WORK/raw" --max-bytes "$MAX_BYTES")
-if [[ "$MODE" == full ]]; then
+if [[ "$MODE" == full && "${PILOT_CONFIG:-pilot}" == optionA ]]; then
+  # Whole corpora. A mono-hour cap would stop MLS before FLEURS and Emozionalmente.
+  DL_ARGS+=(--source mls_it --source fleurs_it --source emozionalmente --source datahive)
+elif [[ "$MODE" == full ]]; then
   MONO_H=$("$PY" -c 'import pilot_config; print(pilot_config.MONO_HOURS)')
   DL_ARGS+=(--max-mono-hours "$MONO_H")
 else
@@ -193,14 +196,14 @@ resources || true
 status "synthetic stereo"
 SYN_ARGS=(--manifest "$WORK/raw/manifest.jsonl" --work "$WORK/audio" --dialogue-s "$DIALOGUE_S")
 if [[ "$MODE" == full ]]; then
-  SYN_H=$("$PY" -c 'import pilot_config; print(pilot_config.SYNTH_STEREO_HOURS)')
+  SYN_H=$("$PY" -c 'import pilot_config; p=pilot_config.plan(); print(p["synth_hours"])')
   SYN_ARGS+=(--max-synth-hours "$SYN_H")
 fi
 "$PY" "$ROOT/runpod/prepare_audio.py" "${SYN_ARGS[@]}"
 cp -f "$WORK/audio/plan.json" "$OUT/plan.json"
 if [[ "$MODE" == full ]]; then
-  rm -rf "$WORK/raw/mls" "$WORK/raw/fleurs"
-  echo "deleted raw MLS and FLEURS after the dialogues were built"
+  rm -rf "$WORK/raw/mls" "$WORK/raw/fleurs" "$WORK/raw/emo"
+  echo "deleted raw MLS, FLEURS, and Emozionalmente after the dialogues were built"
 fi
 resources || true
 fi
@@ -240,6 +243,16 @@ tokenize_one() {
     fi
   fi
   cp -f "$dest/speed.json" "$OUT/speed_w${width}.json" || true
+  publish || true
+}
+
+drop_audio() {
+  local dir="$1"
+  if [[ "${PILOT_CONFIG:-}" == optionA && -d "$dir" ]]; then
+    find "$dir" -type f \( -name '*.wav' -o -name '*.flac' -o -name '*.mp3' \) -delete
+    echo "deleted audio under $dir"
+    resources || true
+  fi
 }
 
 status "tokenize"
@@ -256,11 +269,17 @@ if [[ "$MODE" == local ]]; then
   "$PY" "$ROOT/runpod/tokenize_store.py" --self-test
 fi
 mkdir -p "$WORK/stores"
+if [[ "$MODE" == full ]]; then
+  ( while true; do publish || true; sleep 15; done ) &
+  echo $! > "$OUT/publish.pid"
+fi
 if [[ "$SKIP_PREP" == 1 && -f "$WORK/stores/mono/tokens.bin" ]]; then
   echo "skipping tokenize; restored stores are present"
 else
 tokenize_one "$WORK/audio/mono.jsonl" "$WORK/stores/mono" 8
+drop_audio "$WORK/audio/mono"
 tokenize_one "$WORK/audio/stereo.jsonl" "$WORK/stores/stereo" 16
+drop_audio "$WORK/audio/synth"
 tokenize_one "$WORK/audio/dev.jsonl" "$WORK/stores/dev" 16
 fi
 publish || true

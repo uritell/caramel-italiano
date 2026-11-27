@@ -28,6 +28,36 @@ def _region(path: Path) -> str:
     return body.strip() + "\n"
 
 
+def check_option_a() -> None:
+    import os
+    import option_a
+    est = option_a.estimate(439)
+    if est["over_abort"] or est["gpu_cents"] > 800:
+        raise SystemExit(f"option A estimate is above $8: {est['gpu_cents']} cents")
+    if option_a.MAX_USD_CENTS != 900 or option_a.MAX_WALL_S != 6840:
+        raise SystemExit("option A cap is not $9 or 1.9 h")
+    if option_a.DISK_GB < 200:
+        raise SystemExit("option A disk is smaller than the scaled 182 h measurement")
+    os.environ["PILOT_CONFIG"] = "optionA"
+    try:
+        spec = option_a.training_plan()
+        if spec["s3_end"] <= 1254:
+            raise SystemExit("option A did not add steps for the larger pools")
+        cmds = stages.full_commands("python", Path("m"), Path("s"), Path("d"), Path("runs"))
+        blob = " ".join(" ".join(argv) for _, argv, _ in cmds)
+        if str(spec["s1_stop"]) not in blob or "--save_best" not in blob:
+            raise SystemExit("option A commands lost the step count or save_best")
+    finally:
+        os.environ.pop("PILOT_CONFIG", None)
+    # The module-level pilot numbers must still describe the retry.
+    if stages.S1_STOP != 156:
+        raise SystemExit("import-time pilot steps changed")
+    print(
+        f"option A ok: {est['seconds'] / 60:.1f} min, "
+        f"${est['gpu_cents'] / 100:.2f} GPU, disk ${est['disk_cents'] / 100:.2f}"
+    )
+
+
 def check_cost() -> None:
     if cost.GPU_COUNT != 1 or cost.MAX_USD_CENTS != 1200 or cost.CONTAINER_DISK_GB != 160:
         raise SystemExit("retry config is not 1 GPU, $12, 160 GB")
@@ -260,6 +290,7 @@ def check_shell() -> None:
 
 def main() -> int:
     check_cost()
+    check_option_a()
     check_graphql_shape()
     check_stages()
     check_watchdog_copies()

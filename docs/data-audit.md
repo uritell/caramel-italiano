@@ -208,7 +208,7 @@ No other open corpus in this audit both (i) is clearly licensed for commercial m
 | MLS IT train+dev+test | 257.83 | Canonical LibriVox-derived set |
 | FLEURS IT | ≈12 | “Per language” figure; IT-specific total not stated |
 | ITALIC | 15.46 | Short assistant-style prompts; voice-cloning caveat |
-| Emozionalmente | not added | Total hours not stated at source |
+| Emozionalmente | ≈7.3 | Option A downloads all of OpenSLR 161. 6,902 × 3.81 s from the OpenSLR page; not a published total |
 | **Headline unique OK Group B** | **≈ 22,640 h** | Using 363.9 + 21,900 + 91 + 257.83 + 12 + 15.46 |
 
 If unvalidated Common Voice clips are included, add ~66.6 h (430.5 − 363.9). If VoxPopuli unlabelled is rejected on domain grounds (parliament ≠ “one-person speech” in the caramel sense), unique OK Group B falls to **≈ 649 h** (CV + MLS + FLEURS + ITALIC) — far closer to, or below, the ~5,800 h recipe.
