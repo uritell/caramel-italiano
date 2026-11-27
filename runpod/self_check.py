@@ -424,6 +424,164 @@ def check_proxy_retry_and_pull() -> None:
     print("proxy retry ok")
 
 
+def check_upload_proxy_retry() -> None:
+    """An empty proxy 404 is retried on the same chunk. A 404 with a body is fatal."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import chat_upload
+
+    mode = {"phase": "flap"}
+    counts = {"root": 0, "status": 0, "post": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            route = self.path.split("?", 1)[0]
+            if route in ("/", ""):
+                counts["root"] += 1
+                if counts["root"] == 1:
+                    self._send(404, b"")
+                    return
+                self._send(200, b'{"files":[]}')
+                return
+            counts["status"] += 1
+            if counts["status"] == 1 and mode["phase"] == "flap":
+                self._send(404, b"")
+                return
+            body = b'{"ok":true,"complete":false,"have":[],"bytes":0}'
+            if mode["phase"] == "done":
+                body = b'{"ok":true,"complete":true,"have":[0],"bytes":4}'
+            self._send(200, body)
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length") or "0")
+            if length:
+                self.rfile.read(length)
+            counts["post"] += 1
+            if mode["phase"] == "fatal":
+                self._send(404, b"no such file")
+                return
+            if mode["phase"] == "client":
+                self._send(413, b"too large")
+                return
+            if mode["phase"] == "exhaust" or counts["post"] == 1:
+                self._send(502 if mode["phase"] == "exhaust" else 404, b"")
+                return
+            mode["phase"] = "done"
+            self._send(200, b'{"ok":true,"complete":true,"have":[0],"bytes":4}')
+
+        def log_message(self, fmt, *args):
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    src = Path("/tmp/caramel-proxy-retry.bin")
+    src.write_bytes(b"data")
+    try:
+        try:
+            chat_upload.wait_for_pull_server(base, "secret", timeout=0, pause=lambda _s: None)
+            raise SystemExit("a proxy 404 with no steady GET / did not time out")
+        except chat_upload.UploadFailed as exc:
+            if exc.status != 0:
+                raise SystemExit(f"readiness timeout should not be a client status, got {exc.status}")
+        counts["root"] = 0
+        chat_upload.wait_for_pull_server(base, "secret", timeout=5, pause=lambda _s: None)
+        if counts["root"] < 3:
+            raise SystemExit(f"GET / was not required twice after the empty 404 ({counts['root']})")
+        chat_upload.upload_file(
+            base, "secret", src, "stores/dev/tokens.bin", chunk_bytes=32, attempts=4, pause=lambda _s: None,
+        )
+        if counts["post"] != 2 or counts["status"] < 2:
+            raise SystemExit(f"empty 404 was not retried on the same chunk: {counts}")
+        mode["phase"] = "fatal"
+        counts["post"] = 0
+        try:
+            chat_upload.upload_file(
+                base, "secret", src, "stores/dev/tokens.bin", chunk_bytes=32, attempts=4, pause=lambda _s: None,
+            )
+            raise SystemExit("a 404 with a body did not abort")
+        except chat_upload.UploadFailed as exc:
+            if exc.status != 404 or counts["post"] != 1:
+                raise SystemExit(f"non-empty 404 was retried: status={exc.status} posts={counts['post']}")
+        mode["phase"] = "client"
+        counts["post"] = 0
+        try:
+            chat_upload.upload_file(
+                base, "secret", src, "stores/dev/tokens.bin", chunk_bytes=32, attempts=4, pause=lambda _s: None,
+            )
+            raise SystemExit("HTTP 413 did not abort")
+        except chat_upload.UploadFailed as exc:
+            if exc.status != 413 or counts["post"] != 1:
+                raise SystemExit(f"413 was retried: status={exc.status} posts={counts['post']}")
+        mode["phase"] = "exhaust"
+        counts["post"] = 0
+        try:
+            chat_upload.upload_file(
+                base, "secret", src, "stores/dev/tokens.bin", chunk_bytes=32, attempts=3, pause=lambda _s: None,
+            )
+            raise SystemExit("exhausted proxy errors did not fail")
+        except chat_upload.UploadFailed as exc:
+            if exc.status != 0 or counts["post"] != 3:
+                raise SystemExit(f"retries did not stop at the attempt cap: status={exc.status} posts={counts['post']}")
+    finally:
+        httpd.shutdown()
+    print("upload proxy retry ok")
+
+
+def check_upload_abort_pulls() -> None:
+    """After chunk retries are exhausted, pull logs and then terminate."""
+    import tempfile
+    import chat_upload
+
+    order = []
+
+    def status(pod_id, key):
+        return {"pod": {"id": pod_id, "desiredStatus": "RUNNING", "costPerHr": 4.39,
+                        "runtime": {"uptimeInSeconds": 5}}, "via": "test"}
+
+    def pull(*_a, **_k):
+        order.append("pull")
+        return "proxy"
+
+    def term(*_a, **_k):
+        order.append("term")
+        return {"via": "test"}
+
+    def boom(*_a, **_k):
+        raise chat_upload.UploadFailed(
+            "stores/dev/tokens.bin chunk 0 failed 8 times: HTTP 404: b''", status=0,
+        )
+
+    saved = (graphql_api.pod_status, graphql_api.terminate_pod, launch.pull_outputs,
+             launch.pull_server_answered, launch.upload_stores_chunked, time.sleep)
+    graphql_api.pod_status = status
+    graphql_api.terminate_pod = term
+    launch.pull_outputs = pull
+    launch.pull_server_answered = lambda *_a, **_k: True
+    launch.upload_stores_chunked = boom
+    time.sleep = lambda _s: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = launch.follow(
+                "pod123", "k", "tok", int(time.time()), 439, Path(tmp), "",
+                wall_s=3600, cap_cents=300, stores_dir=Path("stores"),
+            )
+    finally:
+        (graphql_api.pod_status, graphql_api.terminate_pod, launch.pull_outputs,
+         launch.pull_server_answered, launch.upload_stores_chunked, time.sleep) = saved
+    if rc != 1 or order != ["pull", "term"]:
+        raise SystemExit(f"upload failure did not pull before terminate: rc={rc} order={order}")
+    print("upload abort pulls ok")
+
+
 def main() -> int:
     check_cost()
     check_option_a()
@@ -435,6 +593,8 @@ def main() -> int:
     check_shell()
     check_launch_dispatch()
     check_proxy_retry_and_pull()
+    check_upload_proxy_retry()
+    check_upload_abort_pulls()
     print("self-check ok")
     return 0
 

@@ -425,9 +425,9 @@ def proxy_base(pod_id: str) -> str:
     return f"https://{pod_id}-8080.proxy.runpod.net"
 
 
-def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 5, pause=time.sleep) -> bytes:
-    """GET one pull-server URL. A proxy 5xx is retried. A 4xx is returned to the caller."""
-    delay = 1.0
+def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 8, pause=time.sleep) -> bytes:
+    """GET one pull-server URL. An empty 404 or a 5xx is retried. A real 4xx is not."""
+    delay = 2.0
     last: Exception | None = None
     for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"X-Pilot-Token": token, "User-Agent": "caramel-italiano-pilot"})
@@ -435,7 +435,9 @@ def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 5, pause=
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
-            if not (500 <= exc.code < 600):
+            body = exc.read() if exc.fp is not None else b""
+            retryable = 500 <= exc.code < 600 or (exc.code == 404 and not body.strip())
+            if not retryable:
                 raise
             last = exc
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
@@ -444,7 +446,7 @@ def _http_get(url: str, token: str, timeout: int = 60, attempts: int = 5, pause=
             break
         print(f"proxy GET retry {attempt + 1}/{attempts}: {last}", flush=True)
         pause(delay)
-        delay = min(delay * 2, 20)
+        delay = min(delay * 2, 60)
     if isinstance(last, urllib.error.HTTPError):
         raise last
     raise last if last is not None else RuntimeError(f"GET failed: {url}")
@@ -522,9 +524,10 @@ def _pull_http(pod: dict, dest: Path, token: str) -> bool:
 
 def upload_stores_chunked(pod_id: str, token: str, src: Path, chunk_bytes: int = 32 * 1024 * 1024) -> None:
     """Send stores/ through the proxy in 32 MB pieces. The pod must not re-tokenize."""
-    from chat_upload import notify_ready, upload_file
+    from chat_upload import notify_ready, upload_file, wait_for_pull_server
 
     base = proxy_base(pod_id)
+    wait_for_pull_server(base, token)
     root = src if (src / "mono").is_dir() or (src / "stereo").is_dir() else src / "stores"
     if not (root / "stereo" / "tokens.bin").is_file():
         raise SystemExit(f"{root} has no stereo/tokens.bin")
@@ -542,8 +545,10 @@ def upload_restore(pod_id: str, token: str, src: Path) -> None:
     """Send stores/ and checkpoints/ so the new pod can skip download and tokenize."""
     import http.client
     from urllib.parse import urlparse
+    from chat_upload import wait_for_pull_server
 
     base = proxy_base(pod_id)
+    wait_for_pull_server(base, token)
     parsed = urlparse(base)
     sent = 0
     for folder in ("stores", "checkpoints"):
@@ -762,11 +767,16 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wa
             if not proxy_up:
                 proxy_up = pull_server_answered(pod_id, token)
             if proxy_up and (resume or stores_dir) and not uploaded:
-                if stores_dir:
-                    upload_stores_chunked(pod_id, token, Path(stores_dir))
-                else:
-                    upload_restore(pod_id, token, Path(resume))
-                uploaded = True
+                try:
+                    if stores_dir:
+                        upload_stores_chunked(pod_id, token, Path(stores_dir))
+                    else:
+                        upload_restore(pod_id, token, Path(resume))
+                    uploaded = True
+                except (Exception, SystemExit) as exc:
+                    print(f"{_stamp()} upload aborted: {exc}", flush=True)
+                    terminate(f"upload failed: {exc}")
+                    return 1
             print(
                 f"{_stamp()} [cost] {elapsed}s  {cost.format_usd(spent)}  "
                 f"rate {cost.format_usd(rate)}/h  status {status or 'unknown'}  "

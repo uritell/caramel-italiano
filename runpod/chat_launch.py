@@ -357,7 +357,7 @@ def dry_run(
     print(f"prefer datacenters: {', '.join(EU_DATACENTERS)}")
     print(f"stop: {minutes} min or {cost.format_usd(cap_cents)}, whichever first, plus RunPod terminateAfter")
     print(f"30 min on the A40 check price is {cost.format_usd(half_hour)}")
-    print(f"upload chunks: {chunk_bytes // (1024 * 1024)} MB through the proxy, stop on HTTP 4xx")
+    print(f"upload chunks: {chunk_bytes // (1024 * 1024)} MB through the proxy; empty 404 and 502/503/504 retry, other 4xx stops the pod")
     print(f"voice: temp {temp} top_k {top_k} gate {'on' if gate else 'off'} hangover {hangover_ms} ms")
     print("the user's RUNPOD_API_KEY is not put in the pod env")
     if model_problem and model_dir is not None:
