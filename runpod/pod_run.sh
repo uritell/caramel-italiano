@@ -176,6 +176,17 @@ if [[ "$MODE" == full && "${PILOT_RESUME:-}" == "1" ]]; then
     echo "restored stores from upload"
   fi
 fi
+if [[ "$MODE" == full && "${PILOT_CONFIG:-}" == warmstart ]]; then
+  if ! grep -q -- '--init-weights' "$ROOT/third_party/caramel/train.py"; then
+    patch -d "$ROOT/third_party/caramel" -p1 < "$ROOT/runpod/patches/train-init-weights.patch"
+  fi
+  if [[ ! -f "$WORK/stores/stereo/tokens.bin" ]]; then
+    echo "warmstart needs the uploaded Option A stores"
+    exit 1
+  fi
+  SKIP_PREP=1
+  echo "warmstart: using uploaded stores, no download and no tokenize"
+fi
 
 if [[ "$SKIP_PREP" == 0 ]]; then
 status "download open audio"
@@ -286,6 +297,11 @@ publish || true
 resources || true
 export PILOT_OUT="$OUT"
 export PILOT_WORK="$WORK"
+if [[ "${PILOT_CONFIG:-}" == warmstart ]]; then
+  status "caramel-1 weights"
+  "$PY" -c 'from huggingface_hub import snapshot_download; snapshot_download("naklecha/caramel-1", local_dir="/workspace/caramel-1")'
+  printf '%s\n' "Base weights: caramel-1 by Nishant Aklecha, Apache License 2.0, https://huggingface.co/naklecha/caramel-1" >> "$OUT/ATTRIBUTION.txt"
+fi
 
 if [[ "$MODE" == full ]]; then
   for store in mono stereo dev; do

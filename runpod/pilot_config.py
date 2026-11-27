@@ -37,8 +37,12 @@ def _steps(hours: float, passes: float, gpus: int, weight: float = 1.0) -> int:
 
 
 def plan(gpus: int = GPU_COUNT) -> dict:
-    if os.environ.get("PILOT_CONFIG") == "optionA":
+    name = os.environ.get("PILOT_CONFIG")
+    if name == "optionA":
         from option_a import training_plan
+        return training_plan(gpus)
+    if name == "warmstart":
+        from warmstart import training_plan
         return training_plan(gpus)
     s1 = _steps(MONO_HOURS, MONO_PASSES, gpus)
     s2 = _steps(STEREO_HOURS, STEREO_PASSES_S2, gpus, STEREO_WEIGHT)

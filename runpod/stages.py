@@ -93,6 +93,37 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
         "--patience", str(S3_PATIENCE),
         "--save_best",
     ], s3)
+    if p.get("skip_stage1"):
+        stage2 = _one_gpu(py, [
+            "--data", str(stereo), str(mono),
+            "--weights", "0.8", "0.2",
+            "--steps", str(p["s2_steps"]),
+            "--warmup", str(p.get("s2_warmup", 8)),
+            "--lr", str(p.get("lr", "1e-4")),
+            "--init-weights", str(p["init_weights"]),
+            "--boost-first", str(p.get("boost_first", 0)),
+            "--boost", str(p.get("boost", 1)),
+            "--dev", str(dev),
+            "--eval_every", str(p["eval_every"]),
+            "--patience", "0",
+            "--save_best",
+        ], s2)
+        stage3 = _one_gpu(py, [
+            "--data", str(stereo), str(mono),
+            "--weights", "0.8", "0.2",
+            "--steps", str(p["s2_steps"] + p["s3_steps"]),
+            "--resume", str(s2 / "ckpt.pt"),
+            "--sched_start", str(p["s2_steps"]),
+            "--warmup", str(p.get("s3_warmup", 8)),
+            "--lr", str(p.get("lr", "1e-4")),
+            "--boost-first", str(p.get("boost_first", 0)),
+            "--boost", str(p.get("boost", 1)),
+            "--dev", str(dev),
+            "--eval_every", str(p["eval_every"]),
+            "--patience", "2",
+            "--save_best",
+        ], s3)
+        return [("s2", stage2, pin), ("s3", stage3, pin)]
     return [("s1", stage1, pin), ("s2", stage2, pin), ("s3", stage3, pin)]
 
 
