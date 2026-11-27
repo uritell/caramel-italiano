@@ -5,8 +5,11 @@ Listens on port 8080 so RunPod's proxy
 https://<pod>-8080.proxy.runpod.net can reach it. Every request needs the
 random token from the launcher, in ?token= or X-Chat-Token.
 
-The model folder can be uploaded first, the same headers as the pilot pull
-server: POST /upload (X-Pilot-Path under model/) then POST /ready.
+The model folder is uploaded in chunks (32 MB by default, never over 50 MB).
+POST /upload carries the chunk index, offset, total size, and sha256.
+GET /upload?path= reports which chunks are already stored. When the last
+chunk arrives the server checks the size and sha256, then renames the file
+into place. POST /ready loads it.
 
 With no browser for 10 minutes the process terminates the pod using the
 pod-scoped RUNPOD_API_KEY. The Stop button calls POST /stop and does the
@@ -22,10 +25,12 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import numpy as np
 
@@ -37,6 +42,64 @@ from live import FRAME, FrameResult, LiveLoop  # noqa: E402
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 IDLE_S = 600
 ALLOWED = {"model/config.json", "model/model.safetensors", "model/SHA256SUMS"}
+# The RunPod proxy answered HTTP 413 for an 826 MB body. Refuse anything
+# bigger than this before reading it, so one request cannot fill memory.
+MAX_UPLOAD_BODY = 50 * 1024 * 1024
+
+
+def _chunk_count(total: int, chunk_bytes: int) -> int:
+    if total <= 0:
+        return 1
+    return (total + chunk_bytes - 1) // chunk_bytes
+
+
+def _chunk_len(total: int, chunk_bytes: int, index: int) -> int:
+    if total <= 0:
+        return 0
+    start = index * chunk_bytes
+    return min(chunk_bytes, total - start)
+
+
+def _file_sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _assemble(partial: Path, dest: Path, manifest: dict) -> str:
+    """Join the chunks. Return an error string, or "" after the file is in place."""
+    total = int(manifest["total"])
+    stride = int(manifest["chunk_bytes"])
+    sha = manifest["sha256"]
+    n = _chunk_count(total, stride)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".uploading")
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with tmp.open("wb") as out:
+            for index in range(n):
+                part = partial / f"{index:06d}.part"
+                if not part.is_file():
+                    return "missing chunk"
+                with part.open("rb") as inp:
+                    while True:
+                        block = inp.read(1 << 20)
+                        if not block:
+                            break
+                        digest.update(block)
+                        out.write(block)
+                        written += len(block)
+        if written != total or digest.hexdigest() != sha:
+            return "size or sha256 mismatch"
+        tmp.replace(dest)
+    finally:
+        if tmp.is_file() and not dest.is_file():
+            tmp.unlink(missing_ok=True)
+    shutil.rmtree(partial, ignore_errors=True)
+    return ""
 
 
 def token_ok(got: str, expected: str) -> bool:
@@ -112,6 +175,8 @@ class ChatServer:
         self.last_client = time.monotonic()
         self.ready = asyncio.Event()
         self.lock = asyncio.Lock()
+        self.upload_lock = asyncio.Lock()
+        self.upload_writes = 0
         self.stopping = False
         if loop is not None:
             self.ready.set()
@@ -148,6 +213,9 @@ class ChatServer:
             if not self._auth(headers, query):
                 await self._send(writer, 401, b"token required", "text/plain")
                 return
+            if body is None:
+                await self._send(writer, 400, b"chunk larger than 50 MB", "text/plain")
+                return
             route = path.rstrip("/") or "/"
             if headers.get("upgrade", "").lower() == "websocket" and route == "/ws":
                 await self._websocket(reader, writer, headers)
@@ -165,6 +233,9 @@ class ChatServer:
             if method == "GET" and route == "/idle":
                 idle = 0 if self.clients else int(time.monotonic() - self.last_client)
                 await self._send(writer, 200, json.dumps({"idle_s": idle, "limit_s": self.idle_s}).encode(), "application/json")
+                return
+            if method == "GET" and route == "/upload":
+                await self._upload_status(writer, query)
                 return
             if method == "POST" and route == "/upload":
                 await self._upload(writer, headers, body)
@@ -209,6 +280,8 @@ class ChatServer:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         length = int(headers.get("content-length") or "0")
+        if length > MAX_UPLOAD_BODY:
+            return method, path, query, headers, None
         while len(rest) < length:
             rest += await reader.read(min(1 << 20, length - len(rest)))
         return method, path, query, headers, rest[:length]
@@ -232,16 +305,100 @@ class ChatServer:
             return None
         return path
 
-    async def _upload(self, writer, headers, body: bytes) -> None:
-        rel = headers.get("x-pilot-path", "")
-        path = self._safe_model_path(rel)
-        if path is None:
+    def _partial_dir(self, rel: str) -> Path:
+        name = rel.split("/", 1)[1]
+        path = (self.model_dir / ".partial" / name).resolve()
+        path.relative_to(self.model_dir.resolve())
+        return path
+
+    def _status_sync(self, rel: str) -> dict | None:
+        dest = self._safe_model_path(rel)
+        if dest is None:
+            return None
+        if dest.is_file():
+            return {"ok": True, "path": rel, "complete": True, "bytes": dest.stat().st_size, "have": []}
+        partial = self._partial_dir(rel)
+        manifest_path = partial / "manifest.json"
+        if not manifest_path.is_file():
+            return {"ok": True, "path": rel, "complete": False, "have": []}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        total = int(manifest["total"])
+        stride = int(manifest["chunk_bytes"])
+        n = _chunk_count(total, stride)
+        have = []
+        for index in range(n):
+            part = partial / f"{index:06d}.part"
+            if part.is_file() and part.stat().st_size == _chunk_len(total, stride, index):
+                have.append(index)
+        return {
+            "ok": True, "path": rel, "complete": False, "have": have,
+            "total": total, "sha256": manifest.get("sha256"), "chunk_bytes": stride,
+        }
+
+    def _accept_chunk_sync(self, headers: dict, body: bytes) -> tuple[int, dict]:
+        rel = headers.get("x-pilot-path") or ""
+        dest = self._safe_model_path(rel)
+        if dest is None:
+            return 400, {"ok": False, "error": "path not allowed"}
+        try:
+            index = int(headers["x-chunk-index"])
+            offset = int(headers["x-chunk-offset"])
+            total = int(headers["x-total-size"])
+            stride = int(headers["x-chunk-bytes"])
+            sha = headers["x-file-sha256"].strip().lower()
+        except (KeyError, ValueError):
+            return 400, {"ok": False, "error": "chunk headers required"}
+        if stride < 1 or stride > MAX_UPLOAD_BODY or len(body) > MAX_UPLOAD_BODY:
+            return 400, {"ok": False, "error": "chunk too large"}
+        if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            return 400, {"ok": False, "error": "sha256 required"}
+        n = _chunk_count(total, stride)
+        expect = _chunk_len(total, stride, index) if 0 <= index < n else -1
+        if index < 0 or index >= n or offset != index * stride or len(body) != expect:
+            return 400, {"ok": False, "error": "chunk does not match the file size"}
+        if dest.is_file() and dest.stat().st_size == total and _file_sha(dest) == sha:
+            return 200, {"ok": True, "complete": True, "skipped": True, "path": rel, "bytes": total}
+        if dest.is_file():
+            dest.unlink()
+        partial = self._partial_dir(rel)
+        partial.mkdir(parents=True, exist_ok=True)
+        manifest = {"total": total, "sha256": sha, "chunk_bytes": stride, "chunks": n}
+        manifest_path = partial / "manifest.json"
+        if manifest_path.is_file():
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if old.get("sha256") != sha or int(old.get("total", -1)) != total or int(old.get("chunk_bytes", -1)) != stride:
+                return 409, {"ok": False, "error": "upload already started for a different file"}
+        else:
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        part = partial / f"{index:06d}.part"
+        tmp = partial / f"{index:06d}.part.tmp"
+        tmp.write_bytes(body)
+        tmp.replace(part)
+        self.upload_writes += 1
+        have = [i for i in range(n) if (partial / f"{i:06d}.part").is_file() and (partial / f"{i:06d}.part").stat().st_size == _chunk_len(total, stride, i)]
+        if len(have) != n:
+            return 200, {"ok": True, "complete": False, "have": have, "path": rel}
+        error = _assemble(partial, dest, manifest)
+        if error:
+            return 400, {"ok": False, "error": error}
+        return 200, {"ok": True, "complete": True, "path": rel, "bytes": total, "have": have}
+
+    async def _upload_status(self, writer, query: str) -> None:
+        rel = (parse_qs(query).get("path") or [""])[0]
+        async with self.upload_lock:
+            payload = self._status_sync(rel)
+        if payload is None:
             await self._send(writer, 400, b"path not allowed", "text/plain")
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
         self.touch()
-        await self._send(writer, 200, json.dumps({"ok": True, "bytes": len(body), "path": rel}).encode(), "application/json")
+        await self._send(writer, 200, json.dumps(payload).encode(), "application/json")
+
+    async def _upload(self, writer, headers, body: bytes) -> None:
+        async with self.upload_lock:
+            code, payload = await asyncio.to_thread(self._accept_chunk_sync, headers, body)
+        self.touch()
+        raw = json.dumps(payload).encode()
+        await self._send(writer, code, raw, "application/json")
 
     async def _mark_ready(self, writer) -> None:
         if not (self.model_dir / "config.json").is_file() or not (self.model_dir / "model.safetensors").is_file():

@@ -30,6 +30,9 @@ from pathlib import Path
 
 import cost
 import graphql_api
+from chat_upload import (
+    DEFAULT_CHUNK_BYTES, MAX_CHUNK_BYTES, UploadFailed, confirm_pod_gone, notify_ready, upload_files,
+)
 from launch import IMAGE, docker_args_json, proxy_base, bootstrap_raw_url
 
 HERE = Path(__file__).resolve().parent
@@ -208,44 +211,15 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def upload_model(pod_id: str, token: str, model_dir: Path) -> None:
-    import http.client
-    from urllib.parse import urlparse
-
+def upload_model(pod_id: str, token: str, model_dir: Path, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> None:
+    """Send the weights in chunks. A 4xx, including proxy 413, raises UploadFailed."""
     base = proxy_base(pod_id)
-    parsed = urlparse(base)
-    files = ("config.json", "model.safetensors")
-    extra = model_dir / "SHA256SUMS"
-    names = list(files) + (["SHA256SUMS"] if extra.is_file() else [])
-    for name in names:
-        path = model_dir / name
-        size = path.stat().st_size
-        rel = f"model/{name}"
-        conn = http.client.HTTPSConnection(parsed.hostname, timeout=600)
-        with path.open("rb") as fh:
-            conn.request("POST", "/upload", body=fh, headers={
-                "X-Chat-Token": token,
-                "X-Pilot-Token": token,
-                "X-Pilot-Path": rel,
-                "Content-Length": str(size),
-                "Content-Type": "application/octet-stream",
-            })
-        resp = conn.getresponse()
-        resp.read()
-        conn.close()
-        if resp.status != 200:
-            raise RuntimeError(f"upload {rel} returned {resp.status}")
-        print(f"uploaded {rel} ({size} bytes)", flush=True)
-    conn = http.client.HTTPSConnection(parsed.hostname, timeout=120)
-    conn.request("POST", "/ready", body=b"", headers={
-        "X-Chat-Token": token,
-        "Content-Length": "0",
-    })
-    resp = conn.getresponse()
-    resp.read()
-    conn.close()
-    if resp.status != 200:
-        raise RuntimeError(f"ready returned {resp.status}")
+    pairs = [(model_dir / name, f"model/{name}") for name in ("config.json", "model.safetensors")]
+    sums = model_dir / "SHA256SUMS"
+    if sums.is_file():
+        pairs.append((sums, "model/SHA256SUMS"))
+    upload_files(base, token, pairs, chunk_bytes=chunk_bytes)
+    notify_ready(base, token)
     print("model ready", flush=True)
 
 
@@ -261,7 +235,7 @@ def _health(pod_id: str, token: str) -> bool:
         return False
 
 
-def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, wall_s: int, cap_cents: int, model_dir: Path) -> int:
+def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, wall_s: int, cap_cents: int, model_dir: Path, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
     missing = 0
     uploaded = False
     healthy = False
@@ -321,10 +295,14 @@ def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, wall_
                 return 1
             if healthy and not uploaded:
                 try:
-                    upload_model(pod_id, token, model_dir)
-                except (TimeoutError, OSError, RuntimeError) as exc:
-                    print(f"{_stamp()} upload will retry: {exc}", flush=True)
-                    continue
+                    upload_model(pod_id, token, model_dir, chunk_bytes)
+                except UploadFailed as exc:
+                    print(f"{_stamp()} upload aborted: {exc}", flush=True)
+                    terminate(str(exc))
+                    left = confirm_pod_gone(pod_id, api_key, graphql_api.terminate_pod, graphql_api.list_pod_ids)
+                    if pod_id in left:
+                        print(f"{_stamp()} pod {pod_id} may still be billing", flush=True)
+                    return 1
                 uploaded = True
                 print(f"open this page: {proxy_base(pod_id)}/?token={token}", flush=True)
     except KeyboardInterrupt:
@@ -340,7 +318,7 @@ def _check_model_dir(path: Path | None, required: bool) -> str | None:
     return None
 
 
-def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path | None) -> int:
+def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path | None, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
     wall_s = minutes * 60
     epoch = int(time.time())
     body = build_create_input(CANDIDATES[0][0], CANDIDATES[0][1], epoch, "dry-run-token", repo_url, repo_ref, wall_s, cap_cents)
@@ -356,6 +334,7 @@ def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_di
     print(f"prefer datacenters: {', '.join(EU_DATACENTERS)}")
     print(f"stop: {minutes} min or {cost.format_usd(cap_cents)}, whichever first, plus RunPod terminateAfter")
     print(f"30 min on the A40 check price is {cost.format_usd(half_hour)}")
+    print(f"upload chunks: {chunk_bytes // (1024 * 1024)} MB through the proxy, stop on HTTP 4xx")
     print("the user's RUNPOD_API_KEY is not put in the pod env")
     if model_problem and model_dir is not None:
         problems.append(model_problem)
@@ -373,7 +352,7 @@ def dry_run(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_di
     return 0
 
 
-def launch(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path) -> int:
+def launch(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir: Path, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
     import secrets
 
     problem = _check_model_dir(model_dir, required=True)
@@ -416,7 +395,7 @@ def launch(minutes: int, cap_cents: int, repo_url: str, repo_ref: str, model_dir
         return 1
     print(f"pod {pod_id}", flush=True)
     print(f"chat URL (after the model upload finishes): {proxy_base(pod_id)}/?token={token}", flush=True)
-    return follow(pod_id, api_key, token, epoch, hourly, wall_s, cap_cents, model_dir)
+    return follow(pod_id, api_key, token, epoch, hourly, wall_s, cap_cents, model_dir, chunk_bytes)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -428,17 +407,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-usd", type=float, default=DEFAULT_CAP_CENTS / 100)
     p.add_argument("--repo-url", default=os.environ.get("CARAMEL_REPO_URL", "https://github.com/uritell/caramel-italiano.git"))
     p.add_argument("--repo-ref", default=os.environ.get("CARAMEL_REPO_REF", "main"))
+    p.add_argument("--chunk-mb", type=int, default=int(os.environ.get("CHAT_UPLOAD_CHUNK_MB", "32")),
+                   help="upload piece size in MB, 1..50 (default 32)")
     args = p.parse_args(argv)
     if args.minutes > MAX_MINUTES or args.minutes < 1:
         print(f"--minutes must be 1..{MAX_MINUTES}")
         return 1
     cap_cents = cost.dollars_to_cents_up(args.max_usd)
+    if args.chunk_mb < 1 or args.chunk_mb * 1024 * 1024 > MAX_CHUNK_BYTES:
+        print("--chunk-mb must be 1..50")
+        return 1
+    chunk_bytes = args.chunk_mb * 1024 * 1024
     if args.launch:
         if args.model_dir is None:
             print("--launch needs --model-dir")
             return 1
-        return launch(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir)
-    return dry_run(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir)
+        return launch(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes)
+    return dry_run(args.minutes, cap_cents, args.repo_url, args.repo_ref, args.model_dir, chunk_bytes)
 
 
 if __name__ == "__main__":
