@@ -177,6 +177,52 @@ python scripts/smoke_pilot.py
 # train/README.md.
 ```
 
+## Talk to the model
+
+This is a phone or laptop page that lets you speak, and the Italian model
+speaks back, one short piece at a time. The weights are not in git. They
+are the `config.json` and `model.safetensors` folder on the operator's
+machine (`runpod/retrieved/605n4gr7j7dz7z/caramel-it`).
+
+Check the plan. This does not spend money:
+
+```bash
+python runpod/chat_launch.py --dry-run --model-dir runpod/retrieved/605n4gr7j7dz7z/caramel-it
+```
+
+Start a chat. This rents one Secure Cloud GPU:
+
+```bash
+export RUNPOD_API_KEY=...
+python runpod/chat_launch.py --launch --model-dir runpod/retrieved/605n4gr7j7dz7z/caramel-it
+```
+
+The script prints one https address. Open it. Press the big Start button
+and allow the microphone. You should see "Listening", a delay in
+milliseconds, and how many minutes are left on the memory. Press Stop
+when you are done. Stop deletes the machine.
+
+Leave the terminal open while you talk. It prints the running cost.
+Ctrl-C deletes the machine. If the terminal closes, the pod still stops
+itself at the time limit.
+
+What it costs. The first choice is an A40 at about $0.59 an hour (the
+price checked on 27 Nov 2026). If that GPU is missing or costs more than
+$1.20 an hour, the script tries an RTX 4090 (about $0.89 an hour), then
+an L40S. Anything above $1.20 an hour is refused. A 30 minute
+conversation on the A40 is about **$0.30**. Uploading the weights and
+loading the codec adds a few minutes, so a half hour at the keyboard is
+about **$0.35**. The default machine dies after **60 minutes** or
+**$1.50**, whichever comes first. It also dies after **10 minutes** with
+nobody connected. `--minutes` can be at most 120.
+
+The model only remembers the last **4 minutes** of the conversation
+(3000 frames, 240 seconds). When that fills, the page says so and starts
+a fresh conversation. The old audio is not kept.
+
+Your RunPod key stays on your machine. The pod uses the key RunPod gives
+the pod itself when it is time to shut down.
+
 ## Repository layout
 
 | Path | What it is for |
@@ -187,7 +233,8 @@ python scripts/smoke_pilot.py
 | `score/` | Energy-based two-track timing statistics, real versus synthetic |
 | `eval/` | ASR word clarity, timing stats; `eval/codec_test/` holds the completed codec test |
 | `train/` | How to run the three upstream training stages |
-| `runpod/` | One-command pilot on a 2× H100 SXM pod, with a dry run that rents nothing |
+| `runpod/` | Pilot launcher. The current plan is one H100 and a dry run that rents nothing |
+| `chat/` | Browser voice chat with the trained model. `runpod/chat_launch.py` rents one small GPU |
 | `third_party/caramel/` | Upstream caramel, git submodule pinned to `84a9271d265841543287d4044d7ef80991a2b003` |
 | `docs/data-audit.md` | Licence and access audit (27 Nov 2026) |
 | `DATA_LICENSES.md` | One row per pilot dataset / codec, with attribution text |

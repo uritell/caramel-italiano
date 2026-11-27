@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Talk</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+      justify-content: space-between; padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
+      font: 20px/1.4 system-ui, sans-serif; background: #1c1915; color: #f6f1e7;
+    }
+    h1 { font-size: 1.4rem; font-weight: 650; margin: 0 0 8px; }
+    #status { font-size: 1.15rem; margin: 0; }
+    button {
+      width: 100%; min-height: 112px; border: 0; border-radius: 28px;
+      font: 700 2rem/1 system-ui, sans-serif; background: #f0d7a4; color: #1c1915;
+    }
+    button.stop { background: #e7b2a2; }
+    button:disabled { opacity: 0.6; }
+  </style>
+</head>
+<body>
+  <div>
+    <h1>Talk</h1>
+    <p id="status">Press Start. The page will ask for the microphone.</p>
+  </div>
+  <button id="go" type="button">Start</button>
+  <script>
+    const button = document.getElementById("go");
+    const statusEl = document.getElementById("status");
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token") || "";
+    const SR = 24000;
+    const FRAME = 1920;
+    let running = false;
+    let ctx, worklet, socket, micStream, playTime = 0, queued = 0, usingHttp = false;
+    let micBuf = new Float32Array(0);
+
+    function setStatus(text) { statusEl.textContent = text; }
+
+    function resample(chunk, fromRate) {
+      if (fromRate === SR) return chunk;
+      const outLen = Math.max(1, Math.round(chunk.length * SR / fromRate));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const pos = i * fromRate / SR;
+        const j = Math.floor(pos);
+        const frac = pos - j;
+        const a = chunk[Math.min(j, chunk.length - 1)];
+        const b = chunk[Math.min(j + 1, chunk.length - 1)];
+        out[i] = a + (b - a) * frac;
+      }
+      return out;
+    }
+
+    function appendMic(chunk) {
+      const next = new Float32Array(micBuf.length + chunk.length);
+      next.set(micBuf);
+      next.set(chunk, micBuf.length);
+      micBuf = next;
+      while (micBuf.length >= FRAME) {
+        const frame = micBuf.slice(0, FRAME);
+        micBuf = micBuf.slice(FRAME);
+        sendFrame(frame);
+      }
+    }
+
+    function i16(frame) {
+      const out = new Int16Array(frame.length);
+      for (let i = 0; i < frame.length; i++) {
+        const v = Math.max(-1, Math.min(1, frame[i]));
+        out[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+      }
+      return out;
+    }
+
+    function f32FromI16(buf) {
+      const view = new Int16Array(buf);
+      const out = new Float32Array(view.length);
+      for (let i = 0; i < view.length; i++) out[i] = view[i] / 32768;
+      return out;
+    }
+
+    function playPcm(samples) {
+      if (!samples.length || !ctx) return;
+      const buffer = ctx.createBuffer(1, samples.length, SR);
+      buffer.copyToChannel(samples, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      const when = Math.max(ctx.currentTime + 0.05, playTime);
+      src.start(when);
+      playTime = when + samples.length / SR;
+      queued += samples.length;
+      src.onended = () => { queued = Math.max(0, queued - samples.length); };
+    }
+
+    function describe(msg, extraDelay) {
+      const delay = Math.round((msg.ms || 0) + (extraDelay || 0));
+      const left = (msg.minutes_left == null) ? "" : " About " + msg.minutes_left.toFixed(1) + " minutes left on the 4 minute memory.";
+      if (msg.reset) return "The 4 minute memory is full. Starting a fresh conversation." + left;
+      if (msg.status && msg.status !== "Listening.") return msg.status;
+      return "Listening. Delay " + delay + " ms." + left;
+    }
+
+    function sendFrame(frame) {
+      const pcm = i16(frame);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(pcm.buffer);
+        return;
+      }
+      sendHttp(pcm);
+    }
+
+    async function sendHttp(pcm) {
+      usingHttp = true;
+      const res = await fetch("/frame?token=" + encodeURIComponent(token), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: pcm.buffer,
+      });
+      if (!res.ok) { setStatus("The reply failed. Press Start to try again."); return; }
+      const msg = {
+        status: res.headers.get("X-Chat-Status") || "Listening.",
+        ms: Number(res.headers.get("X-Chat-Ms") || 0),
+        minutes_left: Number(res.headers.get("X-Chat-Minutes-Left") || 4),
+        reset: res.headers.get("X-Chat-Reset") === "1",
+      };
+      const audio = f32FromI16(await res.arrayBuffer());
+      playPcm(audio);
+      const bufferedMs = queued / SR * 1000;
+      setStatus(describe(msg, bufferedMs) + " Using short messages.");
+    }
+
+    function openSocket() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(token));
+      ws.binaryType = "arraybuffer";
+      let lastMsg = null;
+      socket = ws;
+      ws.onopen = () => setStatus("Connecting. Waiting for the first sound.");
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          lastMsg = JSON.parse(ev.data);
+          if (!lastMsg.samples) setStatus(describe(lastMsg, queued / SR * 1000));
+          return;
+        }
+        playPcm(f32FromI16(ev.data));
+        if (lastMsg) setStatus(describe(lastMsg, queued / SR * 1000));
+      };
+      ws.onerror = () => { if (running) setStatus("The live connection failed. Trying short messages."); };
+      ws.onclose = () => { if (running && !usingHttp) setStatus("Connection closed. Press Start to try again."); };
+    }
+
+    async function start() {
+      if (!token) { setStatus("This page has no token in the address."); return; }
+      button.disabled = true;
+      setStatus("Connecting.");
+      ctx = new AudioContext();
+      await ctx.resume();
+      await ctx.audioWorklet.addModule("/worklet.js?token=" + encodeURIComponent(token));
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        video: false,
+      });
+      const source = ctx.createMediaStreamSource(micStream);
+      worklet = new AudioWorkletNode(ctx, "mic-capture");
+      worklet.port.onmessage = (ev) => appendMic(resample(ev.data, ctx.sampleRate));
+      source.connect(worklet);
+      running = true;
+      openSocket();
+      button.textContent = "Stop";
+      button.classList.add("stop");
+      button.disabled = false;
+    }
+
+    async function stop() {
+      running = false;
+      if (socket) socket.close();
+      if (micStream) micStream.getTracks().forEach((t) => t.stop());
+      if (ctx) await ctx.close();
+      socket = null; micStream = null; ctx = null; micBuf = new Float32Array(0);
+      button.textContent = "Start";
+      button.classList.remove("stop");
+      setStatus("Stopping the machine.");
+      try {
+        await fetch("/stop?token=" + encodeURIComponent(token), { method: "POST" });
+        setStatus("Stopped. The machine is shutting down.");
+      } catch (err) {
+        setStatus("Stopped on this page. The machine may still be running.");
+      }
+    }
+
+    button.addEventListener("click", () => {
+      if (running) stop();
+      else start().catch((err) => {
+        button.disabled = false;
+        setStatus("Could not start the microphone. " + (err && err.message ? err.message : ""));
+      });
+    });
+  </script>
+</body>
+</html>
