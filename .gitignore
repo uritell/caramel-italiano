@@ -63,6 +63,11 @@ caramel-italiano-*/
 *.log
 eval/codec_test/*.json
 
+# RunPod pilot smoke outputs and the local CPU venv
+runpod/local-out/
+runpod/.venv-cpu/
+runpod/retrieved/
+
 # OS / editor
 .DS_Store
 Thumbs.db

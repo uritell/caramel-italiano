@@ -158,6 +158,22 @@ Tokenizing the 275 h already downloaded is a separate CPU cost, about
 from that smoke are a 10 minute mono slice and about an hour of stereo,
 not the pools above.
 
+## RunPod launch
+
+`runpod/` runs these same three commands on one Secure Cloud 2× H100 SXM
+pod. `<mono>`, `<stereo>`, and `<dev>` are the stores `pod_run.sh` builds:
+MLS and FLEURS mono, the synthetic dialogues plus the real DataHive calls
+kept for training, and a held-out DataHive stereo store. The pod attempt
+has its own **USD 25** ceiling. The project cap stays USD 50.
+`python runpod/launch.py --dry-run` checks the plan and creates nothing.
+`python runpod/launch.py --launch` is the command that rents the pod. It
+terminates at 2.5 hours or about $22, whichever comes first. See
+`runpod/README.md`.
+
+The 0.163 GPU-hour figure above is training at the published frame rate.
+Download and tokenization are extra, which is why the pod's wall-clock cap
+is 2.5 hours. The pod writes measured frames/s to `speed.json`.
+
 Other `train.py` flags that matter, with their defaults: `--fpb 24000`
 (frames per batch per GPU), `--lr 3e-4`, `--warmup 50`, `--wd 0.1`,
 `--clip 1.0`, `--workers 6`. Single-GPU training is valid (`python

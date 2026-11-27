@@ -115,15 +115,16 @@ Budget cap: **USD 50**. No rental without a quote and a yes.
    documented in `tokenize/README.md`. `verify_store.py` imports
    upstream `TokenStore` rather than copying it.
 6. **Train (`train/`).** Run the three upstream stages with
-   `third_party/caramel/train.py`. **Pilot-sized `--steps` / `--stop_at`
-   values are TODO** — do not invent them. Size them from measured token
-   hours and the published full-recipe step counts so rented time stays
-   inside $50. On-demand price checks from the planning pass (USD, before
-   tax, 27 Nov 2026): about $1.73/h (Vast.ai verified offer), $4.39/h
-   (RunPod H100), $4.89/h (Lambda H100). The author's full caramel-1 run
-   was about 4 H100 GPU-hours. Tokenizing time is not published; measure
-   it before quoting a remaining budget. Bring an exact quote before
-   renting.
+   `third_party/caramel/train.py`. The one-pod pilot stops at step 401,
+   then 1072, then 1981. See `train/README.md` and `runpod/README.md`.
+   `python runpod/launch.py --dry-run` checks the plan and creates
+   nothing. `python runpod/launch.py --launch` is the command that rents
+   one 2× H100 SXM pod, capped at 2.5 h or about $22. On-demand price
+   checks from the planning pass (USD, before tax, 27 Nov 2026): about
+   $1.73/h (Vast.ai verified offer), $4.39/h (RunPod H100), $4.89/h
+   (Lambda H100). The author's full caramel-1 run was about 4 H100
+   GPU-hours. Tokenizing time is measured on the pod before the stages
+   run.
 7. **Evaluate (`eval/`).** Held-out Italian dev loss, timing / closeness
    stats, ASR word clarity (caramel uses mean ASR log-probability of the
    transcript; this project also reports WER), and listening.
@@ -184,6 +185,7 @@ python scripts/smoke_pilot.py
 | `score/` | Energy-based two-track timing statistics, real versus synthetic |
 | `eval/` | ASR word clarity, timing stats; `eval/codec_test/` holds the completed codec test |
 | `train/` | How to run the three upstream training stages |
+| `runpod/` | One-command pilot on a 2× H100 SXM pod, with a dry run that rents nothing |
 | `third_party/caramel/` | Upstream caramel, git submodule pinned to `84a9271d265841543287d4044d7ef80991a2b003` |
 | `docs/data-audit.md` | Licence and access audit (27 Nov 2026) |
 | `DATA_LICENSES.md` | One row per pilot dataset / codec, with attribution text |
