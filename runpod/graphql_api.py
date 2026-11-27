@@ -285,6 +285,9 @@ def _rest_create_body(pod_input: dict) -> dict:
     }
     if pod_input.get("minCudaVersion"):
         gpu["minCudaVersion"] = pod_input["minCudaVersion"]
+    # Same argv as GraphQL dockerArgs. Arrays, so nothing is split on spaces.
+    # `args` repeats that JSON for a server that only reads the string form.
+    spec = json.loads(pod_input["dockerArgs"])
     body = {
         "name": pod_input.get("name") or "caramel-it-pilot",
         "cloud": pod_input.get("cloudType") or "SECURE",
@@ -294,9 +297,8 @@ def _rest_create_body(pod_input: dict) -> dict:
         "ports": ["22/tcp", "8080/http"],
         "startSsh": True,
         "env": env,
-        "args": json.dumps({
-            "entrypoint": ["/bin/bash", "-lc"],
-            "cmd": [pod_input.get("dockerArgs") or "true"],
-        }),
+        "entrypoint": spec["entrypoint"],
+        "cmd": spec["cmd"],
+        "args": pod_input["dockerArgs"],
     }
     return body

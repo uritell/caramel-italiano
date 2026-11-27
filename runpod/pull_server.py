@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -36,11 +37,33 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return path
 
+    def _json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _ack(self) -> None:
+        (ROOT / "PULLED").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+        self._json(200, {"ok": True})
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._dispatch()
+
     def do_GET(self) -> None:  # noqa: N802
+        self._dispatch()
+
+    def _dispatch(self) -> None:
         if self.headers.get("X-Pilot-Token") != TOKEN:
             self._unauthorized()
             return
-        if self.path.split("?", 1)[0] in ("/", ""):
+        route = self.path.split("?", 1)[0]
+        if route in ("/ack", "/ack/"):
+            self._ack()
+            return
+        if route in ("/", ""):
             files = []
             for dirpath, _dirs, names in os.walk(ROOT):
                 for name in names:

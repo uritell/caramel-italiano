@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -52,6 +54,56 @@ def check_cost() -> None:
     )
 
 
+def _check_pull_ack() -> None:
+    import tempfile
+    import urllib.request
+
+    import socket
+
+    root = Path(tempfile.mkdtemp())
+    (root / "hello.txt").write_text("hi", encoding="utf-8")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    env = os.environ.copy()
+    env.update(PILOT_OUT=str(root), PILOT_PULL_TOKEN="tok", PILOT_PULL_PORT=str(port))
+    proc = subprocess.Popen(
+        [sys.executable, str(HERE / "pull_server.py")],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        import urllib.error
+
+        last = None
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.2)
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 404):
+                    break
+                last = exc
+                time.sleep(0.05)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                time.sleep(0.05)
+        else:
+            raise SystemExit(f"pull server did not start: {last}")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/ack", data=b"", method="POST",
+            headers={"X-Pilot-Token": "tok"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status != 200:
+                raise SystemExit(f"ack status {resp.status}")
+        if not (root / "PULLED").is_file():
+            raise SystemExit("ack did not write PULLED")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+    print("pull ack ok")
+
+
 def check_graphql_shape() -> None:
     blob = (HERE / "graphql_api.py").read_text(encoding="utf-8")
     for needle in (
@@ -67,7 +119,9 @@ def check_graphql_shape() -> None:
         raise SystemExit("graphql client names the unreachable REST host")
     if "podTerminate(input: $input) {" in graphql_api.TERMINATE.replace(" ", ""):
         raise SystemExit("podTerminate must not have a selection set")
-    body = launch.build_create_input(878, 1_700_000_000, "tok", "https://example.invalid/repo.git", "main")
+    body = launch.build_create_input(
+        878, 1_700_000_000, "tok", "https://github.com/uritell/caramel-italiano.git", "main",
+    )
     problems = launch.validate_input(body)
     if problems:
         raise SystemExit("create input rejected: " + "; ".join(problems))
@@ -124,6 +178,8 @@ def check_graphql_shape() -> None:
         pass
     else:
         raise SystemExit("a field error with no securePrice was ignored")
+    launch.rehearse_container_start()
+    _check_pull_ack()
     print("graphql shape ok")
 
 

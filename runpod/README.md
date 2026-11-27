@@ -12,11 +12,8 @@ A two-hour run is about **$18**.
 
 - A RunPod API key in `RUNPOD_API_KEY`. The same account is enough. This
   does not create a new account.
-- An SSH public key already saved on that RunPod account, if you want the
-  launcher to copy files with `scp`. Without it, the launcher uses the pod's
-  HTTP port and a one-time token instead.
-- If this GitHub repo is private, a read token you already have in
-  `GITHUB_TOKEN`. The caramel submodule is public.
+- The repository is public, so the pod downloads `runpod/bootstrap.sh` from
+  GitHub. No GitHub token is required.
 
 Common Voice is not downloaded. It needs a Mozilla Data Collective account.
 
@@ -34,9 +31,7 @@ create a pod.
 
 ```bash
 export RUNPOD_API_KEY=...          # already issued by RunPod
-export GITHUB_TOKEN=...            # only if the repo is private
-export CARAMEL_REPO_REF=main       # or the branch that contains runpod/
-export PILOT_SSH_KEY=~/.ssh/id_ed25519   # optional, for scp
+export CARAMEL_REPO_REF=main       # the branch whose bootstrap.sh the pod curls
 python runpod/launch.py --launch
 ```
 
@@ -116,9 +111,13 @@ old REST host is not used.
 
 ## What the pod runs
 
-`runpod/bootstrap.sh` is the container command. It starts sshd from the
-`PUBLIC_KEY` RunPod injects, starts the watchdog, clones this repo with
-the caramel submodule, then runs `pod_run.sh --full`.
+The container command is `bash -c` with one script argument, sent as JSON
+`{"entrypoint":["/bin/bash","-c"],"cmd":["..."]}` so RunPod does not split it
+on spaces. That script curls `runpod/bootstrap.sh` from this public repo,
+starts it with `nohup`, then `exec /start.sh`. `/start.sh` stays the main
+process, so sshd and the HTTP proxy stay up even if the job exits.
+`bootstrap.sh` starts the watchdog, clones the repo with the caramel
+submodule, and runs `pod_run.sh --full`.
 
 `pod_run.sh` then:
 
@@ -146,16 +145,19 @@ stops adding clips so training and the samples still happen.
 ## Getting the files back
 
 No new account and no bucket. The launcher copies `/workspace/pilot-out`
-before it terminates:
+before it terminates. Direct `ip:port` and SSH are blocked by the
+launcher's egress proxy, so the first try is the RunPod HTTP proxy:
 
-1. **scp** to the pod's public port 22, or to `ssh.runpod.io` with the
-   pod host id, using the SSH key already on your RunPod account. This is
-   the path to use. Direct SSH can copy files. The proxy hop is only a
-   shell, so the script prefers the public port.
-2. If scp does not connect, **HTTP**: the pod serves the same folder on
-   port 8080. Each request must send `X-Pilot-Token`. The launcher prints
-   the token once. The folder is not world-readable without it, and the
-   pod is deleted after the copy.
+`https://<pod-id>-8080.proxy.runpod.net/`
+
+Each request sends `X-Pilot-Token`. After the copy, the launcher calls
+`/ack`, which writes `PULLED` so the pod stops waiting. SSH/scp is only a
+last resort. The folder is not world-readable without the token, and the
+pod is deleted after the copy.
+
+If 12 minutes after create the container uptime is still 0 or less, or
+that proxy URL has not answered, the launcher terminates the pod and
+exits non-zero. A crash loop must not run until the 2.5 hour cap.
 
 What comes back: `best.pt` (or the safetensors export), four sample wavs,
 logs, `speed.json`, `eval.json`, and the attribution note. The optimizer
