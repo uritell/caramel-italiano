@@ -36,9 +36,14 @@ that checkout into the rest of this project. Upstream's own README is
   is in `eval/codec_test/`. Verdict, with caution: 8 codebooks is good
   enough for a short Italian pilot. It is a general 8-codebook trade-off,
   not an Italian-only failure. Conversation audio has not been tested.
-- Training has not started. **No GPU time is rented, and nothing that
-  costs money happens, without the owner's explicit yes.** The starting
-  budget cap is **USD 50**.
+- The free CPU pilot pipeline is in `data/`, `synth/`, `score/` and
+  `tokenize/`. A smoke run downloaded the three open sources (274.9 h
+  measured: MLS 257.83, FLEURS 14.07, DataHive 3.05), built 1.0 h of
+  synthetic stereo, and checked the token stores with upstream
+  `TokenStore`. The timing comparison is `score/comparison.md`.
+  Common Voice was not used. Training has not started. **No GPU time
+  is rented, and nothing that costs money happens, without the owner's
+  explicit yes.** The starting budget cap is **USD 50**.
 
 ## Credits
 
@@ -89,22 +94,26 @@ Budget cap: **USD 50**. No rental without a quote and a yes.
    English, after a fair loudness match, loses comparable audio detail
    (SI-SDR). 32 codebooks is clearly cleaner if a later recipe can afford
    it. See `eval/codec_test/report.md`.
-2. **Data.** Download the four pilot sources (scripts in `data/` are
-   placeholders). Build a manifest of paths, licences, splits, and
-   duration. Common Voice access needs an MDC account, not yet created.
-3. **Synthesis (`synth/`).** Build synthetic two-track Italian dialogues
-   from the open single-speaker sets (left/right speakers, shared
-   timeline), and keep the DataHive sample as the only real stereo
-   conversations.
-4. **Italian timing score (`score/`).** Rebuild caramel's closeness
-   statistics (gaps, overlap, silence, backchannels, and the published
-   recording stats) and **fit the target bands on real Italian
-   conversations** (the DataHive sample, held-out), not on the English
-   Dessa bands. Upstream did not release this scorer.
+2. **Data.** `data/download.py` fetches FLEURS Italian, MLS Italian and
+   the DataHive sample. `data/manifest.py` records path, licence,
+   attribution, split and duration per file. Common Voice is refused
+   until an MDC account exists; this step does not create one.
+3. **Synthesis (`synth/`).** Build synthetic two-track dialogues from
+   MLS speakers (left/right, shared timeline). Gaps, overlaps and
+   backchannel timing are sampled from measurements on the DataHive
+   sample, not from invented constants. FLEURS has no speaker id, so it
+   is mono source material only. The DataHive sample stays the only real
+   stereo conversations.
+4. **Italian timing score (`score/`).** Energy voice activity for the
+   five published timing numbers (turns/min, both talking, nobody
+   talking, median gap, overlapping turn changes/min), plus backchannels.
+   The full 13-statistic closeness bands are not in this folder and are
+   not invented. Upstream did not release the scorer.
 5. **Tokenize (`tokenize/`).** Encode each speaker with Mimi
    (`kyutai/mimi`, 8 codebooks, 24 kHz) into the `tokens.bin` /
    `index.npy` / `meta.json` layout that `train.py` reads. Format is
-   documented in `tokenize/README.md`.
+   documented in `tokenize/README.md`. `verify_store.py` imports
+   upstream `TokenStore` rather than copying it.
 6. **Train (`train/`).** Run the three upstream stages with
    `third_party/caramel/train.py`. **Pilot-sized `--steps` / `--stop_at`
    values are TODO** — do not invent them. Size them from measured token
@@ -150,21 +159,29 @@ python eval/codec_test/run_codec_test.py
 python eval/codec_test/run_followup.py
 python eval/codec_test/run_en_peaknorm.py
 
-# 5. Data, synthesis, tokenization, scoring, training, evaluation:
-#    scripts in data/, synth/, tokenize/, score/, train/, and eval/ are
-#    stubs or documentation until the pipeline is implemented.
-#    Training commands, with pilot step counts left as TODO, are in
-#    train/README.md.
+# 5. CPU-only data pilot (no GPU, no Common Voice, no accounts):
+python data/download.py
+python data/manifest.py
+python score/measure.py          # writes synth/timing_config.json from DataHive
+python synth/synthesize.py --hours 1.0 --seed 0
+python score/score_files.py --audio synth/out/conversations/*.wav \
+    --out score/out/synthetic.json
+python score/compare.py --synthetic score/out/synthetic.json
+# Or the whole smoke, including a Mimi encode and a TokenStore check:
+python scripts/smoke_pilot.py
+
+# Training commands, with pilot step counts left as TODO, are in
+# train/README.md.
 ```
 
 ## Repository layout
 
 | Path | What it is for |
 |---|---|
-| `data/` | Download and manifest stubs for the four pilot corpora |
-| `synth/` | Synthetic two-track dialogue construction |
+| `data/` | Download and manifest for FLEURS Italian, MLS Italian, and the DataHive sample |
+| `synth/` | Synthetic two-track dialogues; timing drawn from DataHive measurements |
 | `tokenize/` | Mimi encode to the token-store format `train.py` expects |
-| `score/` | Italian timing / closeness statistics |
+| `score/` | Energy-based two-track timing statistics, real versus synthetic |
 | `eval/` | ASR word clarity, timing stats; `eval/codec_test/` holds the completed codec test |
 | `train/` | How to run the three upstream training stages |
 | `third_party/caramel/` | Upstream caramel, git submodule pinned to `84a9271d265841543287d4044d7ef80991a2b003` |

@@ -1,0 +1,9 @@
+# CPU stack for the data / synth / tokenize / score pilot.
+# Install torch from the CPU index first (see data/README.md). Do not run
+# third_party/caramel/setup.sh for this step: it installs a CUDA wheel and
+# downloads caramel-1 weights, which this pipeline does not use.
+transformers==4.46.3
+numpy
+soundfile
+huggingface_hub
+pyarrow

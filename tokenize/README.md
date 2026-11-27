@@ -2,14 +2,17 @@
 
 `caramel-1` never trains on raw audio. Each speaker is encoded with
 Kyutai Mimi and written to a folder that
-`third_party/caramel/train.py` (`TokenStore`) memory-maps.
+`third_party/caramel/train.py` (`TokenStore`) memory-maps. This folder
+imports that class to check a store. It does not copy it.
 
-Use the same settings as `third_party/caramel/generate.py`:
+Same settings as `third_party/caramel/generate.py`:
 
 - weights: `kyutai/mimi` (CC BY 4.0; see NOTICE)
-- audio: 24 kHz
+- audio: 24 kHz, resampled with the same bicubic `interpolate` call
 - `num_quantizers=8`
 - frame rate: 12.5 frames per second (80 ms per frame)
+- a stereo file is encoded as a batch of two mono waveforms, one per
+  channel (`x[:2, None]` in `generate.py`), not as a mix
 
 One hour of one-person speech is `12.5 * 8 * 3600 = 360,000` tokens;
 a two-person conversation is twice that.
@@ -24,27 +27,37 @@ A store is **one folder** containing exactly these three files:
 | `index.npy` | `int64`, shape `[clips, 2]` | Each row is `(offset, length)` in **frames**, indexing into the first axis of `tokens.bin`. |
 | `meta.json` | JSON object | `{"width": W, "frames": <total frames in tokens.bin>}`. `width` must equal `W`. |
 
-`TokenStore` does:
-
-```python
-meta = json.load(open(os.path.join(d, "meta.json")))
-self.W, self.index = meta["width"], np.load(os.path.join(d, "index.npy"))
-self.tok = np.memmap(os.path.join(d, "tokens.bin"), dtype=np.uint16, mode="r",
-                     shape=(meta["frames"], self.W))
-```
+For DataHive and for the synthetic wavs, speaker 1 is the left channel
+(the caller, on DataHive) and speaker 2 is the right channel (the callee).
 
 `train.py` then windows clips, and `delay_window()` turns a raw
-`[L, W]` slice into the delayed 16-wide training sequence (a mono clip
-is padded with `-1` for the second speaker; stereo clips are trained in
-both speaker orders). The tokenizer does **not** apply that delay
-pattern; it only writes the raw store.
+`[L, W]` slice into the delayed 16-wide training sequence. The tokenizer
+does not apply that delay. `verify_store.py` imports `TokenStore` and
+`delay_window` and runs both.
 
-Planned stores (names only, not yet built):
+Up to 90 seconds is encoded in one call. Longer files are encoded in
+60 s chunks with 60 s of left context. Mimi's early convolutions keep
+an activation per audio sample, so a half-hour stereo waveform asks for
+about 20 GB on this CPU build and is killed. Chunking avoids that.
+The chunked codes are not identical to a one-shot encode: with 60 s of
+context, a 150 s test clip disagrees on about one percent of tokens,
+almost all in the higher codebooks. `--check-chunking` prints that
+fraction. The smoke conversations are longer than 90 s, so they are
+chunked.
 
-- `tokenize/out/mono/` — width 8, from single-speaker Italian
-- `tokenize/out/stereo/` — width 16, DataHive real conversations plus
-  synthetic two-track dialogues
-- `tokenize/out/dev/` — held-out width-16 conversations for `--dev`
+```bash
+python tokenize/encode_store.py --items items.jsonl --out tokenize/out/mono --width 8
+python tokenize/encode_store.py --items items.jsonl --out tokenize/out/stereo --width 16
+python tokenize/encode_store.py --check-chunking
+python tokenize/verify_store.py --store tokenize/out/mono
+```
 
-Implementation status: not started. Measure tokenization throughput on
-the first rented (or local) hour before budgeting the rest of the $50.
+An items JSONL row is `{"audio": "...", "mode": "mono"|"stereo", "id": "...", "max_seconds": optional}`.
+`max_seconds` keeps a slice from the start of a long file. Stereo mode
+requires two channels and writes width 16.
+
+The script used to be `tokenize/tokenize.py`. That name shadows the
+Python standard library when anything in this directory imports torch,
+so the entry point is `encode_store.py`.
+
+Stores are written under `tokenize/out/` and are gitignored.
