@@ -160,19 +160,32 @@ not the pools above.
 
 ## RunPod launch
 
-`runpod/` runs these same three commands on one Secure Cloud 2× H100 SXM
-pod. `<mono>`, `<stereo>`, and `<dev>` are the stores `pod_run.sh` builds:
-MLS and FLEURS mono, the synthetic dialogues plus the real DataHive calls
-kept for training, and a held-out DataHive stereo store. The pod attempt
-has its own **USD 25** ceiling. The project cap stays USD 50.
+The commands above are the full-data 2-GPU plan (258 h mono, 239 h stereo).
+The retry in `runpod/` is smaller and uses one GPU, so the step counts
+change. `runpod/pilot_config.py` holds the sizes: 100 h mono, 80 h
+synthetic stereo, plus the DataHive training split (2.929 h). The same
+pass targets (0.83, then 2.4, then 3.25 more) on one GPU give:
+
+```text
+stage 1 stop   156
+stage 2 end    622
+stage 3 end    1254
+```
+
+Keeping 401 / 1072 / 1981 would not preserve those passes: the pools are
+smaller, and stages 2 and 3 no longer divide the frames by two GPUs.
+All three stages are `python train.py` with `CUDA_VISIBLE_DEVICES=0`.
+
+`<mono>`, `<stereo>`, and `<dev>` are the stores `pod_run.sh` builds.
 `python runpod/launch.py --dry-run` checks the plan and creates nothing.
 `python runpod/launch.py --launch` is the command that rents the pod. It
-terminates at 2.5 hours or about $22, whichever comes first. See
+terminates at 2.5 hours or $12, whichever comes first. See
 `runpod/README.md`.
 
-The 0.163 GPU-hour figure above is training at the published frame rate.
-Download and tokenization are extra, which is why the pod's wall-clock cap
-is 2.5 hours. The pod writes measured frames/s to `speed.json`.
+The 0.163 GPU-hour figure above is the full-data plan at the published
+frame rate. The retry's training steps are shorter still. Download and
+tokenization dominate the wall clock. The pod writes measured frames/s
+to `speed.json`.
 
 Other `train.py` flags that matter, with their defaults: `--fpb 24000`
 (frames per batch per GPU), `--lr 3e-4`, `--warmup 50`, `--wd 0.1`,

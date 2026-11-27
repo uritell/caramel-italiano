@@ -29,26 +29,51 @@ else
   WORK=/workspace/work
   OUT="${PILOT_OUT:-/workspace/pilot-out}"
 fi
-mkdir -p "$WORK" "$OUT/logs" "$OUT/samples"
-exec > >(tee -a "$OUT/logs/pod_run.log") 2>&1
+mkdir -p "$WORK" "$OUT/logs" "$OUT/samples" "$OUT/stores" "$OUT/checkpoints"
+# A PULLED file from an earlier ack must not skip the grace period.
+rm -f "$OUT/PULLED"
+exec > >(while IFS= read -r line; do printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line"; done | tee -a "$OUT/logs/pod_run.log") 2>&1
 
 status() { printf '%s\n' "$1" | tee "$OUT/status.txt"; }
+resources() {
+  echo "-- disk --"
+  df -h . / /workspace 2>/dev/null || df -h .
+  echo "-- memory --"
+  free -g || true
+}
 
 finish() {
   local rc=$?
   echo "$rc" > "$OUT/exit_code"
-  status "exit $rc"
+  {
+    echo "exit $rc"
+    echo "-- last log lines --"
+    tail -n 200 "$OUT/logs/pod_run.log" 2>/dev/null || true
+  } > "$OUT/status.txt"
+  resources || true
   if [[ "$MODE" == full ]]; then
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/DONE"
-    local i=0
     local grace="${PILOT_PULL_GRACE_S:-600}"
-    while [[ ! -f "$OUT/PULLED" && "$i" -lt "$grace" ]]; do
-      sleep 5
-      i=$((i + 5))
-    done
-    if [[ -x "$ROOT/runpod/watchdog.sh" ]]; then
+    if [[ "$rc" -ne 0 ]]; then
+      rm -f "$OUT/PULLED"
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/FAILED"
+      echo "failure: keeping the pod up for ${grace}s so the error can be pulled"
+      sleep "$grace"
+    else
+      rm -f "$OUT/PULLED"
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/DONE"
+      local i=0
+      while [[ "$i" -lt "$grace" ]]; do
+        if [[ -f "$OUT/PULLED" && "$OUT/PULLED" -nt "$OUT/DONE" ]]; then
+          echo "pull acknowledged"
+          break
+        fi
+        sleep 5
+        i=$((i + 5))
+      done
+    fi
+    if [[ -f "$ROOT/runpod/watchdog.sh" ]]; then
       bash "$ROOT/runpod/watchdog.sh" --once || true
-    elif [[ -x /tmp/pilot-watchdog.sh ]]; then
+    elif [[ -f /tmp/pilot-watchdog.sh ]]; then
       bash /tmp/pilot-watchdog.sh --once || true
     fi
   fi
@@ -58,6 +83,7 @@ trap finish EXIT
 
 status "start mode=$MODE"
 echo "repo $ROOT"
+resources || true
 if [[ "$MODE" == full ]]; then
   nvidia-smi || true
   if [[ ! -f /tmp/pilot-watchdog.pid ]]; then
@@ -130,25 +156,79 @@ if [[ "$MODE" == local ]]; then
   DIALOGUE_S=30
 fi
 
+export PYTHONPATH="$ROOT/runpod${PYTHONPATH:+:$PYTHONPATH}"
+SKIP_PREP=0
+if [[ "$MODE" == full && "${PILOT_RESUME:-}" == "1" ]]; then
+  echo "waiting up to 20 min for uploaded stores"
+  waited=0
+  while [[ ! -f "$OUT/restore/READY" && "$waited" -lt 1200 ]]; do
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [[ -d "$OUT/restore/stores" ]]; then
+    mkdir -p "$WORK"
+    cp -a "$OUT/restore/stores" "$WORK/stores"
+    if [[ -d "$OUT/restore/checkpoints" ]]; then
+      mkdir -p "$WORK/runs"
+      cp -a "$OUT/restore/checkpoints/." "$WORK/runs/"
+    fi
+    SKIP_PREP=1
+    echo "restored stores from upload"
+  fi
+fi
+
+if [[ "$SKIP_PREP" == 0 ]]; then
 status "download open audio"
-"$PY" "$ROOT/runpod/download_open.py" \
-  --out "$WORK/raw" \
-  --max-audio-s "$MAX_AUDIO" \
-  --max-bytes "$MAX_BYTES"
+DL_ARGS=(--out "$WORK/raw" --max-bytes "$MAX_BYTES")
+if [[ "$MODE" == full ]]; then
+  MONO_H=$("$PY" -c 'import pilot_config; print(pilot_config.MONO_HOURS)')
+  DL_ARGS+=(--max-mono-hours "$MONO_H")
+else
+  DL_ARGS+=(--max-audio-s "$MAX_AUDIO")
+fi
+"$PY" "$ROOT/runpod/download_open.py" "${DL_ARGS[@]}"
 cp -f "$WORK/raw/ATTRIBUTION.txt" "$OUT/ATTRIBUTION.txt" || true
+resources || true
 
 status "synthetic stereo"
-"$PY" "$ROOT/runpod/prepare_audio.py" \
-  --manifest "$WORK/raw/manifest.jsonl" \
-  --work "$WORK/audio" \
-  --dialogue-s "$DIALOGUE_S"
+SYN_ARGS=(--manifest "$WORK/raw/manifest.jsonl" --work "$WORK/audio" --dialogue-s "$DIALOGUE_S")
+if [[ "$MODE" == full ]]; then
+  SYN_H=$("$PY" -c 'import pilot_config; print(pilot_config.SYNTH_STEREO_HOURS)')
+  SYN_ARGS+=(--max-synth-hours "$SYN_H")
+fi
+"$PY" "$ROOT/runpod/prepare_audio.py" "${SYN_ARGS[@]}"
 cp -f "$WORK/audio/plan.json" "$OUT/plan.json"
+if [[ "$MODE" == full ]]; then
+  rm -rf "$WORK/raw/mls" "$WORK/raw/fleurs"
+  echo "deleted raw MLS and FLEURS after the dialogues were built"
+fi
+resources || true
+fi
+
+publish() {
+  mkdir -p "$OUT/stores" "$OUT/checkpoints"
+  if [[ -d "$WORK/stores" ]]; then
+    mkdir -p "$OUT/stores"
+    cp -a "$WORK/stores/." "$OUT/stores/"
+  fi
+  local s
+  for s in s1 s2 s3; do
+    if [[ -f "$WORK/runs/$s/ckpt.pt" ]]; then
+      mkdir -p "$OUT/checkpoints/$s"
+      cp -f "$WORK/runs/$s/ckpt.pt" "$OUT/checkpoints/$s/ckpt.pt"
+    fi
+    if [[ -f "$WORK/runs/$s/best.pt" ]]; then
+      mkdir -p "$OUT/checkpoints/$s"
+      cp -f "$WORK/runs/$s/best.pt" "$OUT/checkpoints/$s/best.pt"
+    fi
+  done
+}
 
 tokenize_one() {
   local clips="$1" dest="$2" width="$3"
   local extra=()
   if [[ "$MODE" == full && -n "${PILOT_BILLING_EPOCH:-}" ]]; then
-    extra+=(--parallel --deadline-epoch "$PILOT_BILLING_EPOCH" --reserve-s 1200)
+    extra+=(--deadline-epoch "$PILOT_BILLING_EPOCH" --reserve-s 1200)
   fi
   if ! "$PY" "$ROOT/runpod/tokenize_store.py" \
       --clips "$clips" --out "$dest" --width "$width" "${extra[@]}"; then
@@ -172,10 +252,21 @@ if [[ "$MODE" == local ]]; then
   fi
 fi
 "$PY" -c 'import numpy,soundfile,torch; print("torch", torch.__version__, "cuda", torch.cuda.is_available())'
+if [[ "$MODE" == local ]]; then
+  "$PY" "$ROOT/runpod/tokenize_store.py" --self-test
+fi
 mkdir -p "$WORK/stores"
+if [[ "$SKIP_PREP" == 1 && -f "$WORK/stores/mono/tokens.bin" ]]; then
+  echo "skipping tokenize; restored stores are present"
+else
 tokenize_one "$WORK/audio/mono.jsonl" "$WORK/stores/mono" 8
 tokenize_one "$WORK/audio/stereo.jsonl" "$WORK/stores/stereo" 16
 tokenize_one "$WORK/audio/dev.jsonl" "$WORK/stores/dev" 16
+fi
+publish || true
+resources || true
+export PILOT_OUT="$OUT"
+export PILOT_WORK="$WORK"
 
 if [[ "$MODE" == full ]]; then
   for store in mono stereo dev; do
@@ -206,6 +297,8 @@ else:
     stages.assert_full_numbers(cmds)
 stages.run_commands(cmds, Path("$ROOT/third_party/caramel"), Path("$OUT/logs"))
 PY
+publish || true
+resources || true
 
 status "export"
 src=""
@@ -294,5 +387,7 @@ if [[ "$MODE" == local ]]; then
     tail -n 15 "$log" || true
   done
 fi
+publish || true
+resources || true
 status "done"
 echo "outputs in $OUT"

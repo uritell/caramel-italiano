@@ -1,8 +1,8 @@
-"""Dollar and wall-clock caps for the one-pod Italian pilot.
+"""Dollar and wall-clock caps for the one-GPU retry.
 
 Integer cents, rounded up, so the launcher and the in-pod watchdog stop on
-the same second. At the quoted Secure Cloud price the 2.5 hour wall hits
-before the $22 cap. A higher live price makes the $22 cap hit first.
+the same second. One H100 at $4.39/h for 2.5 h is $10.98, so the clock hits
+before the $12 cap. A higher live price makes the $12 cap hit first.
 """
 from __future__ import annotations
 
@@ -10,20 +10,20 @@ import math
 
 # 2.5 hours. Billing is treated as starting when the create call returns.
 MAX_WALL_S = 9000
-# Hard stop inside the owner's $25 approval.
-MAX_USD_CENTS = 2200
+# Hard stop for this retry. The account had about $12.36 left after the
+# failed 2-GPU pod; $12 leaves a few cents of margin under that.
+MAX_USD_CENTS = 1200
 USER_BUDGET_CENTS = 2500
-GPU_COUNT = 2
+GPU_COUNT = 1
 # Secure Cloud H100 SXM, per GPU-hour, checked 27 Nov 2026.
 QUOTED_CENTS_PER_GPU_HOUR = 439
-# Refuse to launch if the catalog price is above this. 2 GPUs at this rate
-# for 2.5 h is $24.50, still under the $25 approval; the $22 cap would hit
-# earlier. A larger jump is a different quote and needs a new yes.
+# Refuse to launch if the catalog price is above this. One GPU at $4.90
+# for 2.5 h is $12.25, just over this retry's $12 cap.
 MAX_ACCEPT_CENTS_PER_GPU_HOUR = 490
-CONTAINER_DISK_GB = 120
+CONTAINER_DISK_GB = 160
 PULL_GRACE_S = 600
 
-QUOTED_HOURLY_CENTS = QUOTED_CENTS_PER_GPU_HOUR * GPU_COUNT  # 878 = $8.78/h
+QUOTED_HOURLY_CENTS = QUOTED_CENTS_PER_GPU_HOUR * GPU_COUNT  # 439 = $4.39/h
 
 
 def dollars_to_cents_up(amount: float) -> int:

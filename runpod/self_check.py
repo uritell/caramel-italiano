@@ -29,7 +29,9 @@ def _region(path: Path) -> str:
 
 
 def check_cost() -> None:
-    if cost.QUOTED_HOURLY_CENTS != 878:
+    if cost.GPU_COUNT != 1 or cost.MAX_USD_CENTS != 1200 or cost.CONTAINER_DISK_GB != 160:
+        raise SystemExit("retry config is not 1 GPU, $12, 160 GB")
+    if cost.QUOTED_HOURLY_CENTS != 439:
         raise SystemExit(f"quoted hourly cents {cost.QUOTED_HOURLY_CENTS}")
     stop_s, why = cost.first_stop(cost.QUOTED_HOURLY_CENTS)
     if (stop_s, why) != (cost.MAX_WALL_S, "wall"):
@@ -37,12 +39,12 @@ def check_cost() -> None:
     wall_bill = cost.cost_cents(cost.MAX_WALL_S, cost.QUOTED_HOURLY_CENTS)
     if wall_bill > cost.MAX_USD_CENTS or wall_bill > cost.USER_BUDGET_CENTS:
         raise SystemExit(f"2.5 h quote bills {wall_bill} cents")
-    if wall_bill != 2195:
-        raise SystemExit(f"expected $21.95 at the quote, got {wall_bill} cents")
+    if wall_bill != 1098:
+        raise SystemExit(f"expected $10.98 at the quote, got {wall_bill} cents")
     early, early_why = cost.first_stop(2000)  # $20/h pod
     if early_why != "dollars" or early >= cost.MAX_WALL_S:
         raise SystemExit(f"high price should hit dollars first, got {early} {early_why}")
-    if cost.stop_reason(0, 878) is not None:
+    if cost.stop_reason(0, 439) is not None:
         raise SystemExit("t=0 must not stop")
     if cost.price_ok(491) is None:
         raise SystemExit("price above the ceiling was accepted")
@@ -89,6 +91,16 @@ def _check_pull_ack() -> None:
                 time.sleep(0.05)
         else:
             raise SystemExit(f"pull server did not start: {last}")
+        early = urllib.request.Request(
+            f"http://127.0.0.1:{port}/ack", data=b"", method="POST",
+            headers={"X-Pilot-Token": "tok"},
+        )
+        with urllib.request.urlopen(early, timeout=2) as resp:
+            early_body = json.loads(resp.read().decode())
+        if early_body.get("ok") or (root / "PULLED").exists():
+            raise SystemExit("ack before DONE wrote PULLED")
+        (root / "DONE").write_text("done\n", encoding="utf-8")
+        time.sleep(0.05)
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/ack", data=b"", method="POST",
             headers={"X-Pilot-Token": "tok"},
@@ -96,8 +108,8 @@ def _check_pull_ack() -> None:
         with urllib.request.urlopen(req, timeout=2) as resp:
             if resp.status != 200:
                 raise SystemExit(f"ack status {resp.status}")
-        if not (root / "PULLED").is_file():
-            raise SystemExit("ack did not write PULLED")
+        if not (root / "PULLED").is_file() or (root / "PULLED").stat().st_mtime <= (root / "DONE").stat().st_mtime:
+            raise SystemExit("ack after DONE did not write a newer PULLED")
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -127,6 +139,11 @@ def check_graphql_shape() -> None:
         raise SystemExit("create input rejected: " + "; ".join(problems))
     if body["volumeInGb"] != 0 or "networkVolumeId" in body:
         raise SystemExit("create input still asks for storage that outlives the pod")
+    if body.get("gpuCount") != 1 or body.get("containerDiskInGb") != 160:
+        raise SystemExit(f"create input is not 1 GPU / 160 GB: {body.get('gpuCount')} {body.get('containerDiskInGb')}")
+    env_keys = {item["key"] for item in body.get("env") or []}
+    if "RUNPOD_API_KEY" in env_keys:
+        raise SystemExit("create input copies RUNPOD_API_KEY into the pod")
     redacted = json.dumps(launch.redact(body))
     if "tok" in redacted and "PILOT_PULL_TOKEN" in redacted:
         # The dry-run token is replaced. A real token must not survive redact.
@@ -187,8 +204,13 @@ def check_stages() -> None:
     cmds = stages.full_commands("python", Path("mono"), Path("stereo"), Path("dev"), Path("runs"))
     stages.assert_full_numbers(cmds)
     joined = " ".join(" ".join(argv) for _, argv, _ in cmds)
-    if "401" not in joined or "1072" not in joined or "1981" not in joined:
-        raise SystemExit("stage commands lost the pilot step counts")
+    from pilot_config import plan
+    expected = plan()
+    for needle in (str(expected["s1_stop"]), str(expected["s2_end"]), str(expected["s3_end"])):
+        if needle not in joined:
+            raise SystemExit(f"stage commands lost step {needle}")
+    if "torch.distributed" in joined or "--nproc_per_node" in joined:
+        raise SystemExit("stages still launch a second GPU")
     print("stages ok")
 
 
@@ -223,11 +245,17 @@ def check_reader() -> None:
 
 
 def check_shell() -> None:
-    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh"):
+    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh", "supervise.sh"):
         proc = subprocess.run(["bash", "-n", str(HERE / name)], capture_output=True, text=True)
         if proc.returncode != 0:
             raise SystemExit(proc.stderr)
-    print("bash -n ok")
+    bash = subprocess.run(["bash", str(HERE / "watchdog.sh"), "--self-test"], capture_output=True, text=True)
+    if bash.returncode != 0:
+        raise SystemExit(bash.stderr or bash.stdout)
+    dash = subprocess.run(["dash", str(HERE / "watchdog.sh"), "--self-test"], capture_output=True, text=True)
+    if dash.returncode == 0:
+        raise SystemExit("dash ran the watchdog self-test; the cap checks would be skipped")
+    print("bash -n ok; watchdog self-test passes under bash and fails under dash")
 
 
 def main() -> int:

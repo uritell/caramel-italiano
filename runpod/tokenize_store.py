@@ -79,6 +79,66 @@ def _load_mimi(device: str):
     return model
 
 
+def _load_wave(path: str, width: int) -> np.ndarray:
+    """CPU load + resample. Top-level so a process pool can call it."""
+    from audioio import read_audio, resample, to_mono, to_stereo
+
+    audio, sr = read_audio(Path(path))
+    audio = resample(audio, sr, SR)
+    if width == 8:
+        return np.ascontiguousarray(to_mono(audio))
+    return np.ascontiguousarray(to_stereo(audio))
+
+
+class _BatchWriter:
+    """Append token batches so a crash keeps every finished batch."""
+
+    def __init__(self, out: Path, width: int, batch: int):
+        self.out = Path(out)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.width = width
+        self.batch = max(1, batch)
+        self.path = self.out / "tokens.bin"
+        self.pending: list[np.ndarray] = []
+        self.audio_s = 0.0
+        self.encode_s = 0.0
+        if (self.out / "index.npy").exists() and self.path.exists():
+            saved = np.load(self.out / "index.npy")
+            self.index = [tuple(map(int, row)) for row in saved]
+            self.offset = int(self.index[-1][0] + self.index[-1][1]) if self.index else 0
+        else:
+            self.index = []
+            self.offset = 0
+
+    @property
+    def clips_done(self) -> int:
+        return len(self.index)
+
+    def add(self, frames: np.ndarray, audio_s: float, encode_s: float) -> None:
+        if len(frames) == 0:
+            return
+        self.pending.append(np.ascontiguousarray(frames, dtype=np.uint16))
+        self.audio_s += audio_s
+        self.encode_s += encode_s
+        if len(self.pending) >= self.batch:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        blob = np.concatenate(self.pending, axis=0)
+        with self.path.open("ab") as fh:
+            fh.write(blob.tobytes())
+        for frames in self.pending:
+            self.index.append((self.offset, int(len(frames))))
+            self.offset += int(len(frames))
+        self.pending.clear()
+        np.save(self.out / "index.npy", np.asarray(self.index, dtype=np.int64))
+        (self.out / "meta.json").write_text(json.dumps({
+            "width": self.width, "frames": self.offset, "clips": len(self.index),
+        }) + "\n")
+
+
 def encode_clips(
     clips: list[dict],
     out: Path,
@@ -93,52 +153,160 @@ def encode_clips(
 
     if width not in (8, 16):
         raise SystemExit("width must be 8 or 16")
-    out.mkdir(parents=True, exist_ok=True)
+    batch = int(os.environ.get("PILOT_TOKEN_BATCH", "2000"))
+    writer = _BatchWriter(out, width, batch)
+    if writer.clips_done:
+        print(f"resuming {out} at clip {writer.clips_done}", flush=True)
+        clips = clips[writer.clips_done:]
+    if not clips and writer.clips_done:
+        return _finish_writer(writer, device)
     mimi = _load_mimi(device)
-    from audioio import read_audio, resample, to_mono, to_stereo
+    workers = int(os.environ.get("PILOT_LOAD_WORKERS", "4"))
+    pool = None
+    if workers > 0 and len(clips) > 1:
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
-    tokens = []
-    index = []
-    offset = 0
-    audio_s = 0.0
-    encode_s = 0.0
-    for i, clip in enumerate(clips):
-        if deadline_epoch and reserve_s:
-            remaining = deadline_epoch + int(os.environ.get("PILOT_MAX_SECONDS", "9000")) - time.time()
-            if remaining < reserve_s:
-                print(f"stopping tokenize with {remaining:.0f}s left (reserve {reserve_s}s)", flush=True)
-                break
-        audio, sr = read_audio(Path(clip["path"]))
-        audio = resample(audio, sr, SR)
-        t0 = time.perf_counter()
-        if width == 8:
-            frames = _encode_channel(mimi, to_mono(audio), device, chunk_s)
+        pool = ProcessPoolExecutor(max_workers=workers)
+    try:
+        if pool is None:
+            loaded = ((clip, _load_wave(clip["path"], width)) for clip in clips)
+            _encode_loaded(mimi, writer, loaded, width, device, chunk_s, deadline_epoch, reserve_s)
         else:
-            stereo = to_stereo(audio)
-            left = _encode_channel(mimi, stereo[:, 0], device, chunk_s)
-            right = _encode_channel(mimi, stereo[:, 1], device, chunk_s)
-            n = min(len(left), len(right))
-            frames = np.concatenate([left[:n], right[:n]], axis=1) if n else np.zeros((0, 16), np.int64)
-        dt = time.perf_counter() - t0
-        if len(frames) == 0:
-            continue
-        tokens.append(frames.astype(np.uint16))
-        index.append((offset, len(frames)))
-        offset += len(frames)
-        audio_s += len(audio) / SR
-        encode_s += dt
-        if i % 10 == 0 or i + 1 == len(clips):
-            rate = audio_s / encode_s if encode_s else 0
-            print(f"  clip {i + 1}/{len(clips)}  audio {audio_s:.1f}s  {rate:.2f}x realtime", flush=True)
-    del mimi
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if not index:
+            _encode_prefetched(pool, mimi, writer, clips, width, device, chunk_s, deadline_epoch, reserve_s, FIRST_COMPLETED, wait)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+        del mimi
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    writer.flush()
+    if not writer.index:
         raise SystemExit(f"no tokens written for {out}")
-    return _write_store(out, tokens, index, width, audio_s, encode_s, device)
+    return _finish_writer(writer, device)
+
+
+def _past_deadline(deadline_epoch: int, reserve_s: int) -> bool:
+    if not deadline_epoch or not reserve_s:
+        return False
+    remaining = deadline_epoch + int(os.environ.get("PILOT_MAX_SECONDS", "9000")) - time.time()
+    if remaining < reserve_s:
+        print(f"stopping tokenize with {remaining:.0f}s left (reserve {reserve_s}s)", flush=True)
+        return True
+    return False
+
+
+def _frames_for(mimi, wave: np.ndarray, width: int, device: str, chunk_s: float) -> tuple[np.ndarray, float]:
+    audio_s = (len(wave) if wave.ndim == 1 else len(wave)) / SR
+    t0 = time.perf_counter()
+    if width == 8:
+        frames = _encode_channel(mimi, wave, device, chunk_s)
+    else:
+        left = _encode_channel(mimi, wave[:, 0], device, chunk_s)
+        right = _encode_channel(mimi, wave[:, 1], device, chunk_s)
+        n = min(len(left), len(right))
+        frames = np.concatenate([left[:n], right[:n]], axis=1) if n else np.zeros((0, 16), np.int64)
+    return frames, time.perf_counter() - t0
+
+
+def _encode_loaded(mimi, writer, loaded, width, device, chunk_s, deadline_epoch, reserve_s) -> None:
+    for n, (clip, wave) in enumerate(loaded, start=writer.clips_done + 1):
+        if _past_deadline(deadline_epoch, reserve_s):
+            break
+        frames, dt = _frames_for(mimi, wave, width, device, chunk_s)
+        audio_s = len(wave) / SR
+        writer.add(frames, audio_s, dt)
+        if n % 10 == 0:
+            rate = writer.audio_s / writer.encode_s if writer.encode_s else 0
+            print(f"  clip {n}  audio {writer.audio_s:.1f}s  {rate:.2f}x realtime", flush=True)
+
+
+def _encode_prefetched(pool, mimi, writer, clips, width, device, chunk_s, deadline_epoch, reserve_s, first_completed, wait) -> None:
+    inflight = {}
+    pending = iter(clips)
+    window = max(2, int(os.environ.get("PILOT_LOAD_WORKERS", "4")))
+
+    def fill() -> None:
+        while len(inflight) < window:
+            try:
+                clip = next(pending)
+            except StopIteration:
+                return
+            inflight[pool.submit(_load_wave, clip["path"], width)] = clip
+
+    fill()
+    n = writer.clips_done
+    while inflight:
+        if _past_deadline(deadline_epoch, reserve_s):
+            break
+        done, _ = wait(inflight, return_when=first_completed)
+        for fut in done:
+            clip = inflight.pop(fut)
+            wave = fut.result()
+            frames, dt = _frames_for(mimi, wave, width, device, chunk_s)
+            writer.add(frames, len(wave) / SR, dt)
+            n += 1
+            if n % 10 == 0:
+                rate = writer.audio_s / writer.encode_s if writer.encode_s else 0
+                print(f"  clip {n}  audio {writer.audio_s:.1f}s  {rate:.2f}x realtime", flush=True)
+        fill()
+
+
+def _finish_writer(writer: _BatchWriter, device: str) -> dict:
+    writer.flush()
+    speed = {
+        "audio_s": round(writer.audio_s, 3),
+        "encode_s": round(writer.encode_s, 3),
+        "frames": writer.offset,
+        "clips": len(writer.index),
+        "width": writer.width,
+        "frames_per_s": round(writer.offset / writer.encode_s, 1) if writer.encode_s else 0,
+        "realtime_factor": round(writer.audio_s / writer.encode_s, 3) if writer.encode_s else None,
+        "device": device,
+    }
+    (writer.out / "speed.json").write_text(json.dumps(speed, indent=2) + "\n")
+    (writer.out / "meta.json").write_text(json.dumps({
+        "width": writer.width, "frames": writer.offset, "clips": len(writer.index),
+    }) + "\n")
+    print(json.dumps(speed), flush=True)
+    _verify(writer.out)
+    return speed
+
+
+def self_test() -> None:
+    """Force the two-worker merge into a directory that does not exist yet."""
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="tokenize-merge-"))
+    parts = []
+    for i in range(2):
+        part = tmp / f"part{i}"
+        frames = [np.arange(4 * 8, dtype=np.uint16).reshape(4, 8) + i]
+        _write_store(part, frames, [(0, 4)], 8, 0.3, 0.1, "cpu")
+        parts.append(part)
+    dest = tmp / "stores" / "mono"
+    if dest.exists():
+        raise SystemExit("test dest should not exist before merge")
+    os.environ["PILOT_TOKENIZE_FORCE_PARALLEL"] = "1"
+    _merge(parts, dest, 8)
+    if not (dest / "tokens.bin").is_file():
+        raise SystemExit("merge did not create tokens.bin")
+    meta = json.loads((dest / "meta.json").read_text())
+    if meta["frames"] != 8 or meta["width"] != 8:
+        raise SystemExit(f"merged meta wrong: {meta}")
+    # A second batch appends without rewriting the first frames.
+    writer = _BatchWriter(dest, 8, batch=1)
+    if writer.clips_done != 2:
+        raise SystemExit(f"resume saw {writer.clips_done} clips, want 2")
+    writer.add(np.zeros((2, 8), np.uint16), 0.1, 0.01)
+    writer.flush()
+    if writer.clips_done != 3 or writer.offset != 10:
+        raise SystemExit(f"append failed: clips={writer.clips_done} offset={writer.offset}")
+    print(f"tokenize merge self-test ok {dest}", flush=True)
 
 
 def _write_store(out, tokens, index, width, audio_s, encode_s, device) -> dict:
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     all_tok = np.concatenate(tokens, axis=0)
     if all_tok.shape[1] != width:
         raise SystemExit(f"width {all_tok.shape[1]} != {width}")
@@ -206,6 +374,8 @@ def _verify(out: Path) -> None:
 
 
 def _merge(parts: list[Path], dest: Path, width: int) -> dict:
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
     tokens = []
     index = []
     offset = 0
@@ -232,7 +402,9 @@ def encode_maybe_parallel(clips, out, width, chunk_s, deadline_epoch, reserve_s)
     import torch
 
     gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if gpus < 2 or len(clips) < 4 or os.environ.get("PILOT_TOKENIZE_ONE_GPU"):
+    force = os.environ.get("PILOT_TOKENIZE_FORCE_PARALLEL") == "1"
+    out.mkdir(parents=True, exist_ok=True)
+    if not force and (gpus < 2 or len(clips) < 4 or os.environ.get("PILOT_TOKENIZE_ONE_GPU")):
         device = "cuda" if gpus else "cpu"
         return encode_clips(
             clips, out, width, device=device, chunk_s=chunk_s,
@@ -249,12 +421,14 @@ def encode_maybe_parallel(clips, out, width, chunk_s, deadline_epoch, reserve_s)
             for row in subset:
                 fh.write(json.dumps(row) + "\n")
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(i)
         env["PYTHONUNBUFFERED"] = "1"
+        device = "cuda" if gpus else "cpu"
+        if gpus:
+            env["CUDA_VISIBLE_DEVICES"] = str(i)
         cmd = [
             sys.executable, str(Path(__file__).resolve()),
             "--clips", str(clip_path), "--out", str(part), "--width", str(width),
-            "--chunk-s", str(chunk_s), "--device", "cuda",
+            "--chunk-s", str(chunk_s), "--device", device,
         ]
         if deadline_epoch:
             cmd += ["--deadline-epoch", str(deadline_epoch), "--reserve-s", str(reserve_s)]
@@ -271,16 +445,22 @@ def encode_maybe_parallel(clips, out, width, chunk_s, deadline_epoch, reserve_s)
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--clips", type=Path, required=True)
-    p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--width", type=int, choices=(8, 16), required=True)
+    p.add_argument("--clips", type=Path)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--width", type=int, choices=(8, 16))
     p.add_argument("--chunk-s", type=float, default=0.0, help="0 picks 30s on CPU and 120s on GPU")
     p.add_argument("--device", default="")
     p.add_argument("--deadline-epoch", type=int, default=0)
     p.add_argument("--reserve-s", type=int, default=0)
     p.add_argument("--placeholder", action="store_true")
     p.add_argument("--parallel", action="store_true", help="use both GPUs when present")
+    p.add_argument("--self-test", action="store_true", help="CPU merge regression, no model and no pod")
     args = p.parse_args(argv)
+    if args.self_test:
+        self_test()
+        return 0
+    if not args.clips or not args.out or args.width is None:
+        raise SystemExit("--clips, --out, and --width are required")
     clips = _load_clips(args.clips)
     if not clips:
         raise SystemExit(f"no clips in {args.clips}")

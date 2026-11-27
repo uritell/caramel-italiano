@@ -1,12 +1,19 @@
 # RunPod pilot
 
-One 2× H100 SXM pod, one Italian training pass, then the pod is deleted.
+One H100 SXM pod, one Italian training pass, then the pod is deleted.
 Nothing here rents a machine until you pass `--launch`.
 
-The owner approved **$25** total. The scripts stop at **2.5 hours or $22**,
-whichever comes first. At the price checked on 27 Nov 2026 ($4.39 per GPU-hour
-on Secure Cloud) that is about **$21.95** if the run uses the whole 2.5 hours.
-A two-hour run is about **$18**.
+The retry uses **one GPU** and a smaller pool: **100 hours** of MLS/FLEURS
+mono, **80 hours** of synthetic stereo, and the **3 hour** DataHive sample
+(about 2.9 h of that stays in training). Those sizes are
+`runpod/pilot_config.py`. The pass targets are the same as the 2-GPU plan,
+so the step counts change: stage 1 stops at **156**, stage 2 ends at **622**,
+stage 3 ends at **1254**. Keeping 401 / 1072 / 1981 would train a different
+number of passes on this smaller pool and on one GPU.
+
+The owner approved **$25** total. This retry stops at **2.5 hours or $12**,
+whichever comes first. At $4.39 per hour the 2.5 hour mark bills **$10.98**,
+so the clock hits first. A run that finishes in about 2 hours is about **$9**.
 
 ## What you need
 
@@ -38,18 +45,19 @@ python runpod/launch.py --launch
 `--launch` is the command that spends money. With no flag, the script only
 does the dry run.
 
-The pod is a Secure Cloud **2× NVIDIA H100 80GB HBM3** (the SXM 80 GB part).
+The pod is one Secure Cloud **NVIDIA H100 80GB HBM3** (the SXM 80 GB part).
 The image is `runpod/pytorch:2.2.0-cu1281-torch291-ubuntu2404`: Ubuntu 24.04,
 CUDA 12.8.1, PyTorch 2.9.1 built for CUDA 12.8. That matches
 `third_party/caramel/setup.sh` (Python 3.12, torch 2.9.1, CUDA 12.8+).
 The pod asks for a host CUDA version of at least 12.8.
 
-Container disk is 120 GB. `volumeInGb` is 0 and there is no network volume.
+Container disk is 160 GB. `volumeInGb` is 0 and there is no network volume.
+Raw MLS and FLEURS files are deleted after the dialogues are built.
 `terminateAfter` is set to 2.5 hours on the RunPod side as well.
 
 ## How the money cap works
 
-Quoted rate: **$4.39 × 2 GPUs = $8.78 per pod-hour** (878 cents).
+Quoted rate: **$4.39 per pod-hour** (439 cents), one GPU.
 
 The clock starts when the create call returns. Both the launcher and a
 loop inside the pod compute the bill the same way, in whole cents, rounded up:
@@ -61,22 +69,23 @@ cents = (elapsed_seconds * hourly_cents + 3599) / 3600
 They terminate when either of these is true:
 
 - elapsed time is **9000 seconds** (2.5 h), or
-- the rounded bill reaches **2200 cents** ($22).
+- the rounded bill reaches **1200 cents** ($12).
 
-At $8.78/h the 2.5 hour mark is $21.95, so the **clock hits first**, about
-17 seconds before the $22 mark. If the live `costPerHr` on the pod is higher,
-the $22 mark hits first and the run is shorter. Example: at $20/h the dollar
-cap fires at about 1 hour 6 minutes.
+At $4.39/h the 2.5 hour mark is $10.98, so the **clock hits first**. If the
+live `costPerHr` on the pod is higher, the $12 mark hits first. Example: at
+$20/h the dollar cap fires at about 36 minutes.
 
 Before create, the launcher reads the Secure Cloud price from GraphQL. It
-refuses to launch if that price is above **$4.90 per GPU-hour**. Two GPUs at
-$4.90 for 2.5 h would be $24.50, still under the $25 approval, but a higher
-quote needs a new yes.
+refuses to launch if that price is above **$4.90 per GPU-hour**. One GPU at
+$4.90 for 2.5 h is $12.25, just over the $12 cap, so a quote above $4.90
+needs a new yes. The user's API key is not copied into the pod. RunPod
+injects a pod-scoped key, and the in-pod watchdog uses that key to
+terminate.
 
 While the pod is up the launcher prints a line about every 20 seconds:
 
 ```text
-[cost] 1200s  $2.93  rate $8.78/h  status RUNNING  via graphql
+[cost] 1200s  $1.47  rate $4.39/h  status RUNNING  via graphql
 ```
 
 The cap **terminates** the pod (`podTerminate`). It does not stop it. Stop
@@ -130,8 +139,11 @@ submodule, and runs `pod_run.sh --full`.
    the shortest DataHive conversation out for dev. The next shortest is
    used only to fit timing bands.
 4. Encodes with Mimi (8 codebooks, 24 kHz) and writes `speed.json`
-   (frames/s and how many times faster than realtime). Two GPUs split the
-   clip list when both are free.
+   (frames/s and how many times faster than realtime). Audio is loaded
+   and resampled on a CPU worker pool, and tokens are flushed in batches
+   so a crash can resume the same store. After tokenize, and after each
+   training stage, `stores/` and that stage's `ckpt.pt` are copied into
+   the pull directory.
 5. Runs the three stages in `train/README.md`.
 6. Exports the best checkpoint, generates four 8-second Italian self-play
    clips, and writes timing stats plus Italian ASR word clarity
@@ -150,10 +162,28 @@ launcher's egress proxy, so the first try is the RunPod HTTP proxy:
 
 `https://<pod-id>-8080.proxy.runpod.net/`
 
-Each request sends `X-Pilot-Token`. After the copy, the launcher calls
-`/ack`, which writes `PULLED` so the pod stops waiting. SSH/scp is only a
+Each request sends `X-Pilot-Token`. The pod deletes `PULLED` at startup
+and again just before it writes `DONE`. `/ack` writes `PULLED` only when
+`DONE` or `FAILED` already exists and the ack is newer than that file.
+A failure keeps the pod up for the full 10 minutes so the error can be
+copied; an ack during that wait does not end it early. SSH/scp is only a
 last resort. The folder is not world-readable without the token, and the
 pod is deleted after the copy.
+
+If the launcher dies, `bash runpod/supervise.sh` starts `runpod/watch.py`
+again. A network or TLS timeout is retried. The watcher calls terminate
+only after three readings in a row say the pod is gone, and only after
+`myself { pods }` also does not list it. One empty status does not
+terminate a healthy pod.
+
+A later attempt can skip download and tokenize:
+
+```bash
+python runpod/launch.py --launch --resume-from runpod/retrieved/<old-pod-id>
+```
+
+That uploads `stores/` and `checkpoints/` through the pull server once the
+new pod is answering, then the pod copies them into place.
 
 If 12 minutes after create the container uptime is still 0 or less, or
 that proxy URL has not answered, the launcher terminates the pod and
@@ -191,7 +221,28 @@ does not pass `--cfg`.
 ## What this run is not
 
 It is a short pilot, not the English 11,000-hour recipe. Synthetic
-dialogues do not contain real overlap or backchannels. Stage 1 uses one
-GPU while the pod bills for two. Tokenizing uses both GPUs when it can;
-a slow codec can still eat the cap, which is why the speed log and the
-20-minute reserve exist.
+dialogues do not contain real overlap or backchannels. All three stages
+use the one GPU the pod bills for. A slow codec can still eat the cap,
+which is why the speed log and the 20-minute reserve exist.
+
+## Time and cost for this retry
+
+The failed 2-GPU run spent about 50 minutes before tokenize finished
+(download about 35, synthetic audio about 15) and about 24 minutes on
+mono tokenize, which was still short of the full mono pool. About three
+quarters of that tokenize time was CPU read and resample, not the GPU.
+
+Scaled to one GPU and to 100 h mono / 80 h synthetic stereo, a cautious
+estimate is:
+
+- prep (install, download, synth, delete raw): about 30–40 minutes
+- mono tokenize: about 20–30 minutes
+- stereo tokenize (about 83 h, one GPU): about 25–40 minutes
+- the three stages (1254 steps), export, four samples, eval: about 20–30 minutes
+- pull of stores and checkpoints along the way: a few minutes
+
+That is about **1.6–2.2 hours**, or about **$7–$10** at $4.39/h. The
+$12 cap and the 2.5 hour wall ($10.98) both sit above that range. The
+CPU worker pool should help the resample portion; this estimate does not
+assume it makes tokenize several times faster. It is scaled from the
+failed run, not a new measurement.
