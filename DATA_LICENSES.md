@@ -43,7 +43,7 @@ release.
 
 | Work | Source URL | Licence | Attribution text |
 |---|---|---|---|
-| caramel / caramel-1 | [github.com/naklecha/caramel](https://github.com/naklecha/caramel), pinned at `84a9271d265841543287d4044d7ef80991a2b003`; weights at [huggingface.co/naklecha/caramel-1](https://huggingface.co/naklecha/caramel-1) | Apache License 2.0 | Credit the caramel project and Nishant Aklecha / naklecha. See NOTICE for the unfilled upstream copyright-line caveat. |
+| caramel / caramel-1 | [github.com/naklecha/caramel](https://github.com/naklecha/caramel), pinned at `84a9271d265841543287d4044d7ef80991a2b003`; weights at [huggingface.co/naklecha/caramel-1](https://huggingface.co/naklecha/caramel-1) | Apache License 2.0 | Credit the caramel project and Nishant Aklecha / naklecha. The warmstart run initialises from these public bf16 weights (fresh optimizer, no optimizer state in the file) and retrains on the Option A Italian tokens. See NOTICE for the unfilled upstream copyright-line caveat. |
 
 ## What is deliberately not listed as a pilot source
 

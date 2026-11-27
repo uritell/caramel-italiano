@@ -28,6 +28,31 @@ def _region(path: Path) -> str:
     return body.strip() + "\n"
 
 
+def check_warmstart() -> None:
+    import os
+    import warmstart
+    est = warmstart.estimate(439)
+    if est["over_abort"] or est["gpu_cents"] > 250:
+        raise SystemExit(f"warmstart estimate is above $2.50: {est['gpu_cents']} cents")
+    if warmstart.MAX_USD_CENTS != 300 or warmstart.MAX_WALL_S != 2280:
+        raise SystemExit("warmstart cap is not $3 or 38 min")
+    os.environ["PILOT_CONFIG"] = "warmstart"
+    try:
+        cmds = stages.full_commands("python", Path("m"), Path("s"), Path("d"), Path("runs"))
+        names = [name for name, _, _ in cmds]
+        if names != ["s2", "s3"]:
+            raise SystemExit(f"warmstart stages: {names}")
+        blob = " ".join(" ".join(argv) for _, argv, _ in cmds)
+        for needle in ("--init-weights", "--boost-first", "--boost", "1e-4", "--save_best"):
+            if needle not in blob:
+                raise SystemExit(f"warmstart command missing {needle}")
+        if "--resume" in " ".join(cmds[0][1]):
+            raise SystemExit("stage 2 must load safetensors, not resume")
+    finally:
+        os.environ.pop("PILOT_CONFIG", None)
+    print(f"warmstart ok: {est['seconds'] / 60:.1f} min, ${est['gpu_cents'] / 100:.2f} GPU")
+
+
 def check_option_a() -> None:
     import os
     import option_a
@@ -291,6 +316,7 @@ def check_shell() -> None:
 def main() -> int:
     check_cost()
     check_option_a()
+    check_warmstart()
     check_graphql_shape()
     check_stages()
     check_watchdog_copies()

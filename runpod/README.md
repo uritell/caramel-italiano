@@ -48,6 +48,25 @@ stereo, and the same DataHive hold-out as the retry. It starts from
 scratch: the retry checkpoint does not contain the optimizer state
 `train.py` needs to resume.
 
+## Warm start from caramel-1 ($3)
+
+This continues from the English caramel-1 weights and the Option A token
+stores. It does not download audio and it does not tokenize. The dry run
+does not spend money:
+
+```bash
+python3 runpod/launch.py --config warmstart --stores runpod/retrieved/mviebvzw3ht7hn/stores --dry-run
+```
+
+The pod, if you launch it, downloads `naklecha/caramel-1` itself (public,
+Apache 2.0). The stores are uploaded in 32 MB pieces. The hard cap is
+**$3.00** or **38 minutes**, whichever comes first. The dry run refuses
+the plan when the GPU estimate is above $2.50.
+
+```bash
+python3 runpod/launch.py --config warmstart --stores runpod/retrieved/mviebvzw3ht7hn/stores --launch
+```
+
 ## Check, then launch
 
 From the repo root:

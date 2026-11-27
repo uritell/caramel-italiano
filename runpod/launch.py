@@ -29,6 +29,7 @@ import cost
 import graphql_api
 import option_a
 import stages
+import warmstart
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -127,7 +128,7 @@ def build_env(
     }
     # Do not copy the user's key into the pod. RunPod injects a pod-scoped
     # RUNPOD_API_KEY, and that is what watchdog.sh uses to terminate.
-    if os.environ.get("PILOT_RESUME_FROM"):
+    if os.environ.get("PILOT_RESUME_FROM") or config_name == "warmstart":
         env["PILOT_RESUME"] = "1"
     return [{"key": k, "value": v} for k, v in env.items()]
 
@@ -141,7 +142,9 @@ def limits_for(config_name: str) -> dict:
         return {"wall_s": cost.MAX_WALL_S, "cap_cents": cost.MAX_USD_CENTS, "disk_gb": cost.CONTAINER_DISK_GB}
     if config_name == "optionA":
         return {"wall_s": option_a.MAX_WALL_S, "cap_cents": option_a.MAX_USD_CENTS, "disk_gb": option_a.DISK_GB}
-    raise SystemExit(f"unknown --config {config_name!r} (use pilot or optionA)")
+    if config_name == "warmstart":
+        return {"wall_s": warmstart.MAX_WALL_S, "cap_cents": warmstart.MAX_USD_CENTS, "disk_gb": warmstart.DISK_GB}
+    raise SystemExit(f"unknown --config {config_name!r} (use pilot, optionA, or warmstart)")
 
 
 def build_create_input(
@@ -154,7 +157,7 @@ def build_create_input(
     disk_gb = cost.CONTAINER_DISK_GB if disk_gb is None else disk_gb
     deadline = datetime.fromtimestamp(billing_epoch + wall_s, tz=timezone.utc)
     return {
-        "name": "caramel-it-optionA" if config_name == "optionA" else "caramel-it-pilot",
+        "name": f"caramel-it-{config_name}" if config_name != "pilot" else "caramel-it-pilot",
         "cloudType": "SECURE",
         "gpuCount": cost.GPU_COUNT,
         "gpuTypeId": GPU_ID,
@@ -296,6 +299,15 @@ def print_plan(body: dict, hourly_cents: int, wall_s: int | None = None, cap_cen
         Path("tokenize/out/dev"), Path("runs"))))
 
 
+def _warmstart_gate(hourly_cents: int) -> str | None:
+    est = warmstart.estimate(hourly_cents)
+    print("Warmstart phase estimate:")
+    print(warmstart.explain_estimate(est))
+    if est["over_abort"]:
+        return f"GPU estimate {cost.format_usd(est['gpu_cents'])} is above $2.50"
+    return None
+
+
 def _option_a_gate(hourly_cents: int) -> str | None:
     est = option_a.estimate(hourly_cents)
     print("Option A phase estimate (retry rates, not a new measurement):")
@@ -315,6 +327,10 @@ def dry_run(repo_url: str, repo_ref: str, config_name: str = "pilot") -> int:
     problems = validate_input(body)
     if config_name == "optionA":
         gate = _option_a_gate(cost.QUOTED_HOURLY_CENTS)
+        if gate:
+            problems.append(gate)
+    if config_name == "warmstart":
+        gate = _warmstart_gate(cost.QUOTED_HOURLY_CENTS)
         if gate:
             problems.append(gate)
     script_problems = _local_scripts()
@@ -485,6 +501,24 @@ def _pull_http(pod: dict, dest: Path, token: str) -> bool:
     return _pull_http_base(f"http://{ip}:{port}", dest, token)
 
 
+def upload_stores_chunked(pod_id: str, token: str, src: Path, chunk_bytes: int = 32 * 1024 * 1024) -> None:
+    """Send stores/ through the proxy in 32 MB pieces. The pod must not re-tokenize."""
+    from chat_upload import notify_ready, upload_file
+
+    base = proxy_base(pod_id)
+    root = src if (src / "mono").is_dir() or (src / "stereo").is_dir() else src / "stores"
+    if not (root / "stereo" / "tokens.bin").is_file():
+        raise SystemExit(f"{root} has no stereo/tokens.bin")
+    pairs = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            pairs.append((path, "stores/" + str(path.relative_to(root))))
+    for path, rel in pairs:
+        upload_file(base, token, path, rel, chunk_bytes)
+    notify_ready(base, token)
+    print(f"uploaded {len(pairs)} store files and marked READY", flush=True)
+
+
 def upload_restore(pod_id: str, token: str, src: Path) -> None:
     """Send stores/ and checkpoints/ so the new pod can skip download and tokenize."""
     import http.client
@@ -574,7 +608,7 @@ def _uptime_seconds(pod: dict) -> int | None:
     return int(raw)
 
 
-def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str, config_name: str = "pilot") -> int:
+def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str, config_name: str = "pilot", stores_dir: Path | None = None) -> int:
     api_key = os.environ.get("RUNPOD_API_KEY", "")
     if not api_key:
         print("RUNPOD_API_KEY is not set. Nothing was created.")
@@ -586,6 +620,16 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str, config_nam
         gate = _option_a_gate(hourly)
         if gate:
             print(gate)
+            print("Nothing was created.")
+            return 1
+    if config_name == "warmstart":
+        gate = _warmstart_gate(hourly)
+        if gate:
+            print(gate)
+            print("Nothing was created.")
+            return 1
+        if not stores_dir or not (Path(stores_dir) / "stereo" / "tokens.bin").is_file():
+            print(f"--launch --config warmstart needs --stores with stereo/tokens.bin (tried {stores_dir})")
             print("Nothing was created.")
             return 1
     print(
@@ -623,11 +667,11 @@ def launch(repo_url: str, repo_ref: str, out_dir: Path, ssh_key: str, config_nam
 
     return follow(
         pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod,
-        lim["wall_s"], lim["cap_cents"],
+        lim["wall_s"], lim["cap_cents"], stores_dir,
     )
 
 
-def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wall_s=None, cap_cents=None) -> int:
+def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wall_s=None, cap_cents=None, stores_dir=None) -> int:
     wall_s = cost.MAX_WALL_S if wall_s is None else wall_s
     cap_cents = cost.MAX_USD_CENTS if cap_cents is None else cap_cents
     if pod is None:
@@ -698,8 +742,11 @@ def follow(pod_id, api_key, token, epoch, hourly, out_dir, ssh_key, pod=None, wa
                 best_uptime = uptime if best_uptime is None else max(best_uptime, uptime)
             if not proxy_up:
                 proxy_up = pull_server_answered(pod_id, token)
-            if proxy_up and resume and not uploaded:
-                upload_restore(pod_id, token, Path(resume))
+            if proxy_up and (resume or stores_dir) and not uploaded:
+                if stores_dir:
+                    upload_stores_chunked(pod_id, token, Path(stores_dir))
+                else:
+                    upload_restore(pod_id, token, Path(resume))
                 uploaded = True
             print(
                 f"{_stamp()} [cost] {elapsed}s  {cost.format_usd(spent)}  "
@@ -797,8 +844,10 @@ def rehearse_container_start() -> None:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="pilot", choices=["pilot", "optionA"],
-                   help="pilot is the $12 retry; optionA is the $9 larger run")
+    p.add_argument("--config", default="pilot", choices=["pilot", "optionA", "warmstart"],
+                   help="pilot is the $12 retry; optionA is the $9 run; warmstart continues from caramel-1")
+    p.add_argument("--stores", type=Path, default=None,
+                   help="Option A token stores to upload, e.g. runpod/retrieved/mviebvzw3ht7hn/stores")
     p.add_argument("--launch", action="store_true", help="create the pod and watch it")
     p.add_argument("--dry-run", action="store_true", help="validate only (this is also the default)")
     p.add_argument("--repo-url", default=os.environ.get("CARAMEL_REPO_URL", REPO_URL_DEFAULT))
@@ -816,7 +865,7 @@ def main(argv: list[str]) -> int:
         return 2
     if not args.launch:
         return dry_run(args.repo_url, args.repo_ref, args.config)
-    return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key, args.config)
+        return launch(args.repo_url, args.repo_ref, args.out, args.ssh_key, args.config, args.stores)
 
 
 if __name__ == "__main__":

@@ -6,15 +6,26 @@ It is not written into the output directory.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 ROOT = Path(os.environ["PILOT_OUT"]).resolve()
 TOKEN = os.environ["PILOT_PULL_TOKEN"]
+
+
+def _sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -60,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
         return path
 
     def _upload(self) -> None:
+        if self.headers.get("X-Chunk-Index") is not None:
+            self._upload_chunk()
+            return
         rel = self.headers.get("X-Pilot-Path") or ""
         path = self._restore_path(rel)
         if path is None:
@@ -76,6 +90,98 @@ class Handler(BaseHTTPRequestHandler):
                 fh.write(chunk)
                 remaining -= len(chunk)
         self._json(200, {"ok": True, "bytes": length - remaining, "path": rel})
+
+    def _partial(self, rel: str) -> Path:
+        return ROOT / "restore" / ".partial" / rel
+
+    def _upload_status(self) -> None:
+        rel = (parse_qs(self.path.split("?", 1)[-1]).get("path") or [""])[0]
+        dest = self._restore_path(rel)
+        if dest is None:
+            self.send_error(400)
+            return
+        if dest.is_file():
+            self._json(200, {"ok": True, "path": rel, "complete": True, "bytes": dest.stat().st_size, "have": []})
+            return
+        manifest_path = self._partial(rel) / "manifest.json"
+        if not manifest_path.is_file():
+            self._json(200, {"ok": True, "path": rel, "complete": False, "have": []})
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        total, stride = int(manifest["total"]), int(manifest["chunk_bytes"])
+        n = 1 if total <= 0 else (total + stride - 1) // stride
+        have = []
+        for index in range(n):
+            part = self._partial(rel) / f"{index:06d}.part"
+            expect = 0 if total <= 0 else min(stride, total - index * stride)
+            if part.is_file() and part.stat().st_size == expect:
+                have.append(index)
+        self._json(200, {"ok": True, "path": rel, "complete": False, "have": have, "total": total, "sha256": manifest.get("sha256")})
+
+    def _upload_chunk(self) -> None:
+        rel = self.headers.get("X-Pilot-Path") or ""
+        dest = self._restore_path(rel)
+        if dest is None:
+            self.send_error(400)
+            return
+        try:
+            index = int(self.headers["X-Chunk-Index"])
+            offset = int(self.headers["X-Chunk-Offset"])
+            total = int(self.headers["X-Total-Size"])
+            stride = int(self.headers["X-Chunk-Bytes"])
+            sha = self.headers["X-File-Sha256"].strip().lower()
+        except (KeyError, ValueError):
+            self.send_error(400)
+            return
+        length = int(self.headers.get("Content-Length") or "0")
+        if stride < 1 or stride > 50 * 1024 * 1024 or length > 50 * 1024 * 1024:
+            self.send_error(400)
+            return
+        body = self.rfile.read(length)
+        n = 1 if total <= 0 else (total + stride - 1) // stride
+        expect = 0 if total <= 0 else min(stride, total - index * stride)
+        if index < 0 or index >= n or offset != index * stride or len(body) != expect or len(sha) != 64:
+            self.send_error(400)
+            return
+        if dest.is_file() and dest.stat().st_size == total and _sha(dest) == sha:
+            self._json(200, {"ok": True, "complete": True, "skipped": True, "path": rel, "bytes": total})
+            return
+        partial = self._partial(rel)
+        partial.mkdir(parents=True, exist_ok=True)
+        manifest = {"total": total, "sha256": sha, "chunk_bytes": stride}
+        manifest_path = partial / "manifest.json"
+        if manifest_path.is_file():
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if old.get("sha256") != sha or int(old.get("total", -1)) != total:
+                self._json(409, {"ok": False, "error": "different file already started"})
+                return
+        else:
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        part = partial / f"{index:06d}.part"
+        tmp = partial / f"{index:06d}.part.tmp"
+        tmp.write_bytes(body)
+        tmp.replace(part)
+        have = [i for i in range(n) if (partial / f"{i:06d}.part").is_file()]
+        if len(have) != n:
+            self._json(200, {"ok": True, "complete": False, "have": have, "path": rel})
+            return
+        digest = hashlib.sha256()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob = dest.with_name(dest.name + ".uploading")
+        written = 0
+        with blob.open("wb") as out:
+            for i in range(n):
+                data = (partial / f"{i:06d}.part").read_bytes()
+                digest.update(data)
+                out.write(data)
+                written += len(data)
+        if written != total or digest.hexdigest() != sha:
+            blob.unlink(missing_ok=True)
+            self._json(400, {"ok": False, "error": "size or sha256 mismatch"})
+            return
+        blob.replace(dest)
+        shutil.rmtree(partial, ignore_errors=True)
+        self._json(200, {"ok": True, "complete": True, "path": rel, "bytes": total, "have": have})
 
     def _ack(self) -> None:
         # Routine pulls must not create PULLED. Only an ack after DONE or
@@ -118,6 +224,9 @@ class Handler(BaseHTTPRequestHandler):
             self._ack()
             return
         if route == "/upload":
+            if self.command == "GET":
+                self._upload_status()
+                return
             if self.command != "POST":
                 self.send_error(405)
                 return

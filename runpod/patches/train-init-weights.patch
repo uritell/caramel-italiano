@@ -1,0 +1,87 @@
+diff --git a/train.py b/train.py
+index 80eb87e..6a1c45c 100644
+--- a/train.py
++++ b/train.py
+@@ -1,4 +1,21 @@
+ import argparse, json, math, os, threading, time
++
++def _load_init_weights(model, path):
++  """Load a safetensors file. Every tensor name and shape must match; the optimizer is left alone."""
++  from safetensors.torch import load_file
++  if not os.path.isfile(path):
++    raise SystemExit(f"--init-weights file not found: {path}")
++  incoming = load_file(path)
++  current = model.state_dict()
++  missing = sorted(k for k in current if k not in incoming)
++  extra = sorted(k for k in incoming if k not in current)
++  bad = sorted(k for k in current if k in incoming and tuple(incoming[k].shape) != tuple(current[k].shape))
++  if missing or extra or bad:
++    raise SystemExit(
++      "init-weights do not match this model. "
++      f"missing={missing[:12]} extra={extra[:12]} shape_mismatch={bad[:12]}"
++    )
++  model.load_state_dict({k: incoming[k].to(dtype=current[k].dtype) for k in current}, strict=True)
+ import numpy as np, torch, torch.distributed as dist
+ from model import Caramel, Config
+ 
+@@ -38,7 +55,9 @@ def delay_window(raw, L, swap):
+ # Each batch draws one window length L from BUCKETS and holds frames_per_batch // L windows, so the compiled graphs only ever
+ # see 4 shapes. Stores are picked by weight, clips by length, and the window start uniformly.
+ class BatchStream(torch.utils.data.IterableDataset):
+-  def __init__(self, dirs, fpb, weights=None, seed=0, rank=0): self.dirs, self.fpb, self.weights, self.seed, self.rank = dirs, fpb, weights, seed, rank
++  def __init__(self, dirs, fpb, weights=None, seed=0, rank=0, boost_first=0, boost=1.0):
++    self.dirs, self.fpb, self.weights, self.seed, self.rank = dirs, fpb, weights, seed, rank
++    self.boost_first, self.boost = int(boost_first or 0), float(boost or 1.0)
+ 
+   def __iter__(self):
+     wi = torch.utils.data.get_worker_info()
+@@ -48,8 +67,16 @@ class BatchStream(torch.utils.data.IterableDataset):
+     while True:
+       L, seqs = int(rng.choice(BUCKETS)), []
+       for _ in range(max(1, self.fpb // L)):
+-        s = stores[rng.choice(len(stores), p=sw)]
+-        lens = s.index[:, 1]
++        si = int(rng.choice(len(stores), p=sw))
++        s = stores[si]
++        lens = s.index[:, 1].astype(np.float64)
++        # The first store's opening clips (DataHive, written before the synthetic
++        # dialogues) can be sampled more often without a second token store.
++        if si == 0 and self.boost_first:
++          lens = lens.copy()
++          n = min(int(self.boost_first), len(lens))
++          if n:
++            lens[:n] *= float(self.boost)
+         i = int(rng.choice(len(lens), p=lens / lens.sum()))
+         start = int(rng.integers(0, max(1, lens[i] - L + 1)))
+         seqs.append(delay_window(np.asarray(s.window(i, start, L)), L, bool(rng.integers(2))))
+@@ -106,6 +133,11 @@ def main(a):
+   opt = torch.optim.AdamW([{"params": params[0], "weight_decay": a.wd}, {"params": params[1], "weight_decay": 0.0}],
+                           lr=a.lr, betas=(0.9, 0.95), eps=1e-8, fused=cuda)
+   start = 0
++  if getattr(a, "init_weights", "") and a.resume:
++    raise SystemExit("--init-weights starts a fresh optimizer; do not combine it with --resume")
++  if getattr(a, "init_weights", ""):
++    _load_init_weights(model, a.init_weights)
++    if rank == 0: print(f"init-weights {a.init_weights} (fresh optimizer)", flush=True)
+   if a.resume:   # the next stage keeps the weights, the optimizer state and the RNG of the previous one
+     ck = torch.load(a.resume, map_location=dev, weights_only=False)
+     model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); start = ck["step"]
+@@ -115,7 +147,7 @@ def main(a):
+   dmodel = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev.index], bucket_cap_mb=64, gradient_as_bucket_view=True, static_graph=True) if ddp else model
+   if rank == 0: print(f"params {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M  cfg {json.dumps(cfg.__dict__)}", flush=True)
+ 
+-  loader = iter(torch.utils.data.DataLoader(BatchStream(a.data, a.fpb, a.weights, a.seed + 7919 * start, rank), batch_size=None,
++  loader = iter(torch.utils.data.DataLoader(BatchStream(a.data, a.fpb, a.weights, a.seed + 7919 * start, rank, getattr(a, "boost_first", 0), getattr(a, "boost", 1.0)), batch_size=None,
+                 num_workers=a.workers, pin_memory=cuda, prefetch_factor=4 if a.workers else None, persistent_workers=a.workers > 0))
+   end = a.stop_at or a.steps
+   eval_at = (set(range(0, a.steps + 1, a.eval_every)) if a.eval_every else set()) | ({a.stop_at} if a.stop_at else set())
+@@ -176,6 +208,9 @@ if __name__ == "__main__":
+   ap.add_argument("--steps", type=int, required=True, help="end of the LR schedule")
+   ap.add_argument("--stop_at", type=int, default=0, help="stop (and save ckpt.pt) here; the schedule still spans --steps")
+   ap.add_argument("--resume", default="", help="ckpt.pt of the previous stage")
++  ap.add_argument("--init-weights", default="", dest="init_weights", help="safetensors to load before training; optimizer stays fresh")
++  ap.add_argument("--boost-first", type=int, default=0, help="multiply the length-weight of the first N clips of the first store")
++  ap.add_argument("--boost", type=float, default=1.0)
+   ap.add_argument("--sched_start", type=int, default=0, help="restart warmup + cosine at this step")
+   ap.add_argument("--fpb", type=int, default=24000, help="frames per batch per GPU")
+   ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--warmup", type=int, default=50)
