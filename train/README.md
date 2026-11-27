@@ -38,26 +38,31 @@ Run them from `third_party/caramel/`, and point `--data` / `--dev` /
 `--out` at this project's token stores and a gitignored `runs/`
 directory.
 
-## Pilot-sized step counts: TODO (do not invent)
+## Pilot-sized step counts (one RunPod attempt)
 
-`--steps 25000 / 47000` and `--stop_at 9000` belong to the full
-~11,000-hour English mix. They are almost certainly too large for a
-few-hundred-hour Italian pilot and would blow the $50 cap if copied
-blindly.
+The full-recipe `--steps 25000 / 47000` and `--stop_at 9000` belong to
+the ~11,000-hour English mix. This pilot uses a much shorter run, sized
+for one 2× H100 SXM pod under a **USD 25** approval (the project cap
+stays USD 50). The launch scripts live in `runpod/`. They do not rent
+anything until `python runpod/launch.py --launch`.
 
-Before any rental, measure:
+Stages 1 and 2 share one cosine schedule that ends at step 1072
+(η_max = 3e-4, warmup 50). Stage 1 stops early, on one GPU. Stage 3
+restarts the schedule at step 1072 with the published stage-3 peak
+(η_max = 1.5e-4, warmup 200).
 
-- token hours actually written to `tokenize/out/mono` and `.../stereo`
-- frames per second on the chosen GPU (upstream quotes up to ~145.6k
-  frames/s on one H100 with their kernels)
-- tokenization time, which the paper does not publish
+| Stage | GPUs | What is passed to `train.py` | Stop |
+|---|---|---|---|
+| 1. Learn to speak | 1 | `--steps 1072 --stop_at 401` on mono | step 401 |
+| 2. Learn to converse | 2 | `--steps 1072`, resume stage 1, weights 0.8 / 0.2 | step 1072 |
+| 3. Keep going | 2 | `--steps 1981 --stop_at 1981 --sched_start 1072 --warmup 200 --lr 1.5e-4 --save_best` | step 1981 |
 
-Then set `--steps`, `--stop_at`, `--warmup`, and `--sched_start` so
-that the three stages stay inside the remaining budget (on-demand
-prices checked 27 Nov 2026, USD before tax: roughly $1.73/h Vast.ai
-verified H100 offer, $4.39/h RunPod, $4.89/h Lambda). Keep a held-out
-Italian stereo store on `--dev`. Write the chosen numbers here when
-they exist; do not fill them in by guesswork.
+Stage 3 uses `--eval_every 200`. The published stride of 1000 never
+lands between 1072 and 1981, so `--save_best` would not run. Token
+hours and GPU frames/s are still measured on the pod and written to
+`speed.json`; those measurements are what a later, longer run should
+be sized from. Prices checked 27 Nov 2026, USD before tax: about
+$4.39/GPU-h for a RunPod Secure Cloud H100.
 
 Other `train.py` flags that matter, with their defaults: `--fpb 24000`
 (frames per batch per GPU), `--lr 3e-4`, `--warmup 50`, `--wd 0.1`,
