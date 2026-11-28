@@ -165,6 +165,8 @@ def check_plan() -> None:
     values = {item["key"]: item["value"] for item in body["env"]}
     if values.get("CHAT_TEMP") != "0.75" or values.get("CHAT_TOP_K") != "25":
         raise SystemExit(f"launcher sampling defaults drifted: {values.get('CHAT_TEMP')} {values.get('CHAT_TOP_K')}")
+    if values.get("CHAT_IDLE_S") != "600":
+        raise SystemExit(f"chat idle env is not 10 min: {values.get('CHAT_IDLE_S')}")
     if values.get("PILOT_MAX_USD_CENTS") != "150" or values.get("PILOT_MAX_SECONDS") != "3600":
         raise SystemExit("chat caps changed")
     if values.get("PILOT_WATCH_JOB"):
@@ -291,15 +293,34 @@ async def check_server() -> None:
         idle_reasons.append(reason)
         idle_done.set()
 
-    idle = server.ChatServer("secret", Path("/tmp/caramel-chat-model"), LiveLoop(FakeModel(), FakeMimi()), on_idle, idle_s=0.4)
+    idle = server.ChatServer("secret", Path("/tmp/caramel-chat-model"), None, on_idle, idle_s=0.35)
     idle_server = await server.serve(idle, "127.0.0.1", 0)
     try:
-        await asyncio.wait_for(idle_done.wait(), timeout=3)
+        await asyncio.sleep(0.6)
+        if idle_reasons:
+            raise SystemExit(f"idle fired before any browser: {idle_reasons}")
+        if idle.seen_browser:
+            raise SystemExit("the idle clock started with no page view")
+        reader, writer = await asyncio.open_connection("127.0.0.1", idle_server.sockets[0].getsockname()[1])
+        writer.write(b"GET /?token=secret HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        code, _, body = await read_http(reader)
+        writer.close()
+        await writer.wait_closed()
+        if code != 200 or b"Talk" not in body:
+            raise SystemExit(f"page did not load: {code}")
+        if not idle.seen_browser or idle.last_client is None:
+            raise SystemExit("GET / did not start the idle clock")
+        await asyncio.sleep(0.15)
+        if idle_reasons:
+            raise SystemExit("idle fired in the same moment the page was opened")
+        await asyncio.wait_for(idle_done.wait(), timeout=2)
     finally:
+        idle.stopping = True
         idle_server.close()
         await idle_server.wait_closed()
     if idle_reasons != ["idle"]:
-        raise SystemExit(f"idle shutdown did not fire: {idle_reasons}")
+        raise SystemExit(f"idle did not fire after the visitor left: {idle_reasons}")
     print("server ok")
 
 

@@ -52,6 +52,10 @@ DEFAULT_CAP_CENTS = 150
 DISK_GB = 40
 EU_DATACENTERS = ("EU-RO-1", "EU-CZ-1", "EU-NL-1", "EU-FR-1", "EU-SE-1")
 STARTUP_LIMIT_S = 12 * 60
+IDLE_RULE = (
+    "idle: no terminate until a browser opens the page; "
+    "10 min after the last visitor leaves (CHAT_IDLE_S)"
+)
 
 
 def chat_bootstrap_url(repo_url: str, ref: str) -> str:
@@ -98,6 +102,7 @@ def build_env(
         "CHAT_VAD_RMS": str(vad_rms),
         "CHAT_HANGOVER_MS": str(int(hangover_ms)),
         "CHAT_GATE": "1" if gate else "0",
+        "CHAT_IDLE_S": "600",
     }
     # The pod-scoped RUNPOD_API_KEY is injected by RunPod. Do not copy the user's key.
     return [{"key": k, "value": v} for k, v in env.items()]
@@ -347,6 +352,7 @@ def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, wall_
                     return 1
                 uploaded = True
                 print(f"open this page: {proxy_base(pod_id)}/?token={token}", flush=True)
+                print(IDLE_RULE, flush=True)
     except KeyboardInterrupt:
         terminate("interrupted")
         return 1
@@ -385,6 +391,7 @@ def dry_run(
     print(f"30 min on the A40 check price is {cost.format_usd(half_hour)}")
     print(f"upload chunks: {chunk_bytes // (1024 * 1024)} MB through the proxy; empty 404 and 502/503/504 retry, other 4xx stops the pod")
     print(f"voice: temp {temp} top_k {top_k} gate {'on' if gate else 'off'} hangover {hangover_ms} ms")
+    print(IDLE_RULE)
     print("the user's RUNPOD_API_KEY is not put in the pod env")
     if model_problem and model_dir is not None:
         problems.append(model_problem)
@@ -452,6 +459,7 @@ def launch(
         return 1
     print(f"pod {pod_id}", flush=True)
     print(f"chat URL (after the model upload finishes): {proxy_base(pod_id)}/?token={token}", flush=True)
+    print(IDLE_RULE, flush=True)
     return follow(pod_id, api_key, token, epoch, hourly, wall_s, cap_cents, model_dir, chunk_bytes)
 
 

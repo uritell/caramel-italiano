@@ -11,10 +11,13 @@ GET /upload?path= reports which chunks are already stored. When the last
 chunk arrives the server checks the size and sha256, then renames the file
 into place. POST /ready loads it.
 
-With no browser for 10 minutes the process terminates the pod using the
-pod-scoped RUNPOD_API_KEY. The Stop button calls POST /stop and does the
-same. The user's key is never read from anywhere but the environment
-RunPod injects.
+The idle clock starts when a browser opens the page or the websocket.
+Until then the pod stays up; the launcher's time cap, dollar cap, and
+terminateAfter are what end an unused session. After the last visitor
+leaves, the process waits IDLE_S seconds (CHAT_IDLE_S, default 10 min)
+and then terminates the pod with the pod-scoped RUNPOD_API_KEY. The Stop
+button calls POST /stop and does the same. The user's key is never read
+from anywhere but the environment RunPod injects.
 """
 from __future__ import annotations
 
@@ -172,7 +175,8 @@ class ChatServer:
         self.on_terminate = on_terminate
         self.idle_s = idle_s
         self.clients = 0
-        self.last_client = time.monotonic()
+        self.seen_browser = False
+        self.last_client: float | None = None
         self.ready = asyncio.Event()
         self.lock = asyncio.Lock()
         self.upload_lock = asyncio.Lock()
@@ -184,14 +188,21 @@ class ChatServer:
     def touch(self) -> None:
         self.last_client = time.monotonic()
 
+    def note_browser(self) -> None:
+        """A person opened the page or the socket. This starts the idle clock."""
+        self.seen_browser = True
+        self.touch()
+
     async def idle_watch(self) -> None:
         while not self.stopping:
             await asyncio.sleep(min(5.0, max(0.1, self.idle_s / 4)))
+            if not self.seen_browser or self.last_client is None:
+                continue
             if self.clients > 0:
                 self.touch()
                 continue
             if time.monotonic() - self.last_client >= self.idle_s:
-                print("idle: no client, terminating", flush=True)
+                print("idle: browser left, terminating", flush=True)
                 self.stopping = True
                 await asyncio.to_thread(self.on_terminate, "idle")
                 return
@@ -221,9 +232,11 @@ class ChatServer:
                 await self._websocket(reader, writer, headers)
                 return
             if method == "GET" and route == "/":
+                self.note_browser()
                 await self._send(writer, 200, (HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
                 return
             if method == "GET" and route == "/worklet.js":
+                self.note_browser()
                 await self._send(writer, 200, (HERE / "worklet.js").read_bytes(), "text/javascript; charset=utf-8")
                 return
             if method == "GET" and route == "/health":
@@ -231,8 +244,13 @@ class ChatServer:
                 await self._send(writer, 200, b'{"ok":true}', "application/json")
                 return
             if method == "GET" and route == "/idle":
-                idle = 0 if self.clients else int(time.monotonic() - self.last_client)
-                await self._send(writer, 200, json.dumps({"idle_s": idle, "limit_s": self.idle_s}).encode(), "application/json")
+                if not self.seen_browser or self.last_client is None:
+                    idle = None
+                elif self.clients:
+                    idle = 0
+                else:
+                    idle = int(time.monotonic() - self.last_client)
+                await self._send(writer, 200, json.dumps({"idle_s": idle, "limit_s": self.idle_s, "browser": self.seen_browser}).encode(), "application/json")
                 return
             if method == "GET" and route == "/upload":
                 await self._upload_status(writer, query)
@@ -469,7 +487,7 @@ class ChatServer:
         ).encode())
         await writer.drain()
         self.clients += 1
-        self.touch()
+        self.note_browser()
         pending = np.zeros(0, dtype=np.float32)
         try:
             while not self.stopping:
@@ -626,6 +644,20 @@ async def serve(chat: ChatServer, host: str, port: int):
     return server
 
 
+def configured_idle_s() -> int:
+    """Seconds to wait after the last visitor. CHAT_IDLE_S overrides the 10 min default."""
+    raw = os.environ.get("CHAT_IDLE_S", "").strip()
+    if not raw:
+        return IDLE_S
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"CHAT_IDLE_S must be a whole number of seconds, got {raw!r}")
+    if value < 1:
+        raise SystemExit("CHAT_IDLE_S must be at least 1 second")
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-dir", type=Path, default=Path(os.environ.get("CHAT_MODEL_DIR", "/workspace/chat-model")))
@@ -633,7 +665,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=int(os.environ.get("CHAT_PORT", "8080")))
     p.add_argument("--wait-upload", action="store_true")
-    p.add_argument("--idle-s", type=int, default=IDLE_S)
+    p.add_argument("--idle-s", type=int, default=configured_idle_s())
     args = p.parse_args(argv)
     if not args.token:
         raise SystemExit("CHAT_TOKEN is not set")
