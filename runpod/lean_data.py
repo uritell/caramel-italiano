@@ -33,8 +33,9 @@ DOWNLOAD_ALLOWANCE_S = 30 * 60
 # The pod's five-minute encode is what the launcher trusts.
 REFERENCE_RTF = 1145.0
 A40_HOURLY_CENTS = 59
-MAX_USD_CENTS = 550  # $5.50
-MAX_WALL_S = 9 * 3600
+# Data prep only. The approved $4–5.50 total also has to cover the later train.
+MAX_USD_CENTS = 300  # $3.00
+MAX_WALL_S = 6 * 3600
 DISK_GB = 200
 STORE_VOX = "mono_voxpopuli"
 STORE_MLS = "mono_mls2"
@@ -180,7 +181,7 @@ def attribution_text() -> str:
     return "\n".join(ATTRIBUTION[key] for key in ("voxpopuli_it_2015", "mls_it_remainder")) + "\n"
 
 
-def explain_plan() -> str:
+def explain_plan(cap_cents: int = MAX_USD_CENTS) -> str:
     ref = reference_projection()
     lines = [
         f"voxpopuli: {', '.join(VOX_TARS)} from {VOX_BASE}/",
@@ -191,12 +192,12 @@ def explain_plan() -> str:
         f"segments: {SEGMENT_S:.0f} s from t=0, same cap as prepare_audio turns, width {WIDTH}",
         f"stores: {STORE_VOX}, {STORE_MLS}",
         f"tokens only on the way back (about 0.8 GB); raw audio is deleted on the pod",
-        f"cap: ${MAX_USD_CENTS / 100:.2f} or {MAX_WALL_S / 3600:.0f} h, A40 ${A40_HOURLY_CENTS / 100:.2f}/h, "
+        f"cap: ${cap_cents / 100:.2f} or {MAX_WALL_S / 3600:.0f} h, A40 ${A40_HOURLY_CENTS / 100:.2f}/h, "
         f"disk {DISK_GB} GB, terminateAfter set",
         f"reference projection: ${ref['cents'] / 100:.2f} "
         f"({ref['total_s'] / 3600:.2f} h). {ref['note']}.",
         "the pod encodes 5 min first; the launcher refuses the rest if that projection exceeds the cap",
     ]
-    if over_cap(ref["cents"]):
+    if over_cap(ref["cents"], cap_cents):
         lines.append("REFUSING: the reference projection is already over the cap.")
     return "\n".join(lines)

@@ -6,8 +6,8 @@
 
 The default is the dry run. It does not send an API key and it does not
 create a pod. --launch is what spends money. The pod encodes five minutes
-first. If that realtime factor puts the full run over $5.50, the launcher
-terminates and the full encode does not start.
+first. If that realtime factor puts the full run over the cap ($3.00 unless
+--cap says otherwise), the launcher terminates and the full encode does not start.
 """
 from __future__ import annotations
 
@@ -49,11 +49,14 @@ def container_script(raw_url: str) -> str:
     )
 
 
-def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> list[dict]:
+def build_env(
+    hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str,
+    cap_cents: int = lean_data.MAX_USD_CENTS,
+) -> list[dict]:
     env = {
         "PILOT_BILLING_EPOCH": str(billing_epoch),
         "PILOT_MAX_SECONDS": str(lean_data.MAX_WALL_S),
-        "PILOT_MAX_USD_CENTS": str(lean_data.MAX_USD_CENTS),
+        "PILOT_MAX_USD_CENTS": str(cap_cents),
         "PILOT_HOURLY_CENTS": str(hourly_cents),
         "PILOT_WATCH_JOB": "1",
         "PILOT_PULL_TOKEN": token,
@@ -69,7 +72,10 @@ def build_env(hourly_cents: int, billing_epoch: int, token: str, repo_url: str, 
     return [{"key": k, "value": v} for k, v in env.items()]
 
 
-def build_create_input(gpu_id: str, hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str) -> dict:
+def build_create_input(
+    gpu_id: str, hourly_cents: int, billing_epoch: int, token: str, repo_url: str, repo_ref: str,
+    cap_cents: int = lean_data.MAX_USD_CENTS,
+) -> dict:
     deadline = datetime.fromtimestamp(billing_epoch + lean_data.MAX_WALL_S, tz=timezone.utc)
     return {
         "name": "caramel-it-lean-data",
@@ -88,12 +94,12 @@ def build_create_input(gpu_id: str, hourly_cents: int, billing_epoch: int, token
         "supportPublicIp": True,
         "dockerArgs": docker_args_json(container_script(lean_bootstrap_url(repo_url, repo_ref))),
         "terminateAfter": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref),
+        "env": build_env(hourly_cents, billing_epoch, token, repo_url, repo_ref, cap_cents),
         "dataCenterIds": list(EU_DATACENTERS),
     }
 
 
-def validate(body: dict) -> list[str]:
+def validate(body: dict, cap_cents: int = lean_data.MAX_USD_CENTS) -> list[str]:
     problems = []
     if body.get("cloudType") != "SECURE":
         problems.append("cloudType must be SECURE")
@@ -108,26 +114,29 @@ def validate(body: dict) -> list[str]:
     keys = {item["key"]: item["value"] for item in body.get("env") or []}
     if "RUNPOD_API_KEY" in keys:
         problems.append("the user's RUNPOD_API_KEY must not be copied into the pod")
-    if keys.get("PILOT_MAX_USD_CENTS") != str(lean_data.MAX_USD_CENTS):
-        problems.append("cap is not $5.50")
+    if keys.get("PILOT_MAX_USD_CENTS") != str(cap_cents):
+        problems.append(f"cap is not ${cap_cents / 100:.2f}")
+    if keys.get("PILOT_MAX_SECONDS") != str(lean_data.MAX_WALL_S):
+        problems.append("wall is not 6 h")
     if keys.get("PILOT_WATCH_JOB") != "1":
         problems.append("the pod watchdog must terminate after the job and the pull grace")
     if "lean_bootstrap.sh" not in (body.get("dockerArgs") or ""):
         problems.append("start script must fetch lean_bootstrap.sh")
     ref = lean_data.reference_projection(int(keys.get("PILOT_HOURLY_CENTS") or lean_data.A40_HOURLY_CENTS))
-    if lean_data.over_cap(ref["cents"]):
+    if lean_data.over_cap(ref["cents"], cap_cents):
         problems.append(
-            f"reference projection ${ref['cents'] / 100:.2f} is over the ${lean_data.MAX_USD_CENTS / 100:.2f} cap"
+            f"reference projection ${ref['cents'] / 100:.2f} is over the ${cap_cents / 100:.2f} cap"
         )
     return problems
 
 
-def dry_run(repo_url: str, repo_ref: str) -> int:
+def dry_run(repo_url: str, repo_ref: str, cap_cents: int = lean_data.MAX_USD_CENTS) -> int:
     body = build_create_input(
         "NVIDIA A40", lean_data.A40_HOURLY_CENTS, int(time.time()), "dry-run-token", repo_url, repo_ref,
+        cap_cents,
     )
-    problems = validate(body)
-    print(lean_data.explain_plan())
+    problems = validate(body, cap_cents)
+    print(lean_data.explain_plan(cap_cents))
     print()
     print("pull: tokens.bin, index.npy, meta.json, ATTRIBUTION.txt. Streamed. No raw audio.")
     print("Dry run finished. No pod was created. No RunPod API key was sent.")
@@ -143,7 +152,10 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_dir: Path) -> int:
+def follow(
+    pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_dir: Path,
+    cap_cents: int = lean_data.MAX_USD_CENTS,
+) -> int:
     """Watch the pod. A speed-test projection over the cap terminates before the full encode."""
     out_dir.mkdir(parents=True, exist_ok=True)
     decided = False
@@ -176,7 +188,7 @@ def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_d
         if isinstance(raw, (int, float)) and raw > 0:
             rate = cost.dollars_to_cents_up(float(raw))
         spent = cost.cost_cents(elapsed, rate)
-        reason = cost.stop_reason(elapsed, rate, lean_data.MAX_WALL_S, lean_data.MAX_USD_CENTS)
+        reason = cost.stop_reason(elapsed, rate, lean_data.MAX_WALL_S, cap_cents)
         print(f"{_stamp()} [cost] {elapsed}s {cost.format_usd(spent)}", flush=True)
         try:
             pull_outputs(current, out_dir, token, "")
@@ -186,7 +198,7 @@ def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_d
         if report_path.is_file() and not decided:
             report = json.loads(report_path.read_text(encoding="utf-8"))
             decided = True
-            if lean_data.over_cap(int(report.get("cents") or 0)):
+            if lean_data.over_cap(int(report.get("cents") or 0), cap_cents):
                 terminate(
                     f"speed test projects ${int(report['cents']) / 100:.2f}, over the cap"
                 )
@@ -200,7 +212,7 @@ def follow(pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_d
             return 0 if (out_dir / "DONE").is_file() else 1
 
 
-def launch(repo_url: str, repo_ref: str, out: Path) -> int:
+def launch(repo_url: str, repo_ref: str, out: Path, cap_cents: int = lean_data.MAX_USD_CENTS) -> int:
     import secrets
 
     api_key = os.environ.get("RUNPOD_API_KEY", "")
@@ -222,8 +234,8 @@ def launch(repo_url: str, repo_ref: str, out: Path) -> int:
     gpu_id, hourly = picked
     token = secrets.token_urlsafe(24)
     epoch = int(time.time())
-    body = build_create_input(gpu_id, hourly, epoch, token, repo_url, repo_ref)
-    problems = validate(body)
+    body = build_create_input(gpu_id, hourly, epoch, token, repo_url, repo_ref, cap_cents)
+    problems = validate(body, cap_cents)
     if problems:
         print("refusing to create:")
         for item in problems:
@@ -236,7 +248,7 @@ def launch(repo_url: str, repo_ref: str, out: Path) -> int:
         print(f"create response had no id: {created}")
         return 1
     print(f"pod {pod_id}", flush=True)
-    return follow(pod_id, api_key, token, epoch, hourly, out / pod_id)
+    return follow(pod_id, api_key, token, epoch, hourly, out / pod_id, cap_cents)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -246,13 +258,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo-url", default=os.environ.get("CARAMEL_REPO_URL", "https://github.com/uritell/caramel-italiano.git"))
     p.add_argument("--repo-ref", default=os.environ.get("CARAMEL_REPO_REF", "main"))
     p.add_argument("--out", type=Path, default=HERE / "retrieved")
+    p.add_argument("--cap", type=float, default=lean_data.MAX_USD_CENTS / 100,
+                   help="dollar cap for this data pod (default 3.00). The speed test is checked against it.")
     args = p.parse_args(argv)
+    if args.cap <= 0:
+        print("--cap must be a positive number of dollars")
+        return 2
+    cap_cents = cost.dollars_to_cents_up(args.cap)
     if args.launch and args.dry_run:
         print("Pass either --launch or --dry-run.")
         return 2
     if not args.launch:
-        return dry_run(args.repo_url, args.repo_ref)
-    return launch(args.repo_url, args.repo_ref, args.out)
+        return dry_run(args.repo_url, args.repo_ref, cap_cents)
+    return launch(args.repo_url, args.repo_ref, args.out, cap_cents)
 
 
 if __name__ == "__main__":

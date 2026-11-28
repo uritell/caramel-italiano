@@ -86,6 +86,12 @@ def check_speed_gate() -> None:
     fast = lean_data.speed_report(300.0, 1.0, lean_data.A40_HOURLY_CENTS)
     if fast["over_cap"] or fast["rtf"] < 200:
         raise SystemExit(f"a fast encode was refused: {fast}")
+    if lean_data.MAX_USD_CENTS != 300 or lean_data.MAX_WALL_S != 6 * 3600:
+        raise SystemExit("lean data cap is not $3.00 or 6 h")
+    # About $4.85 at the A40 rate: over the $3 prep cap, under the old $5.50.
+    mid = lean_data.speed_report(300.0, 2.0, lean_data.A40_HOURLY_CENTS)
+    if not mid["over_cap"] or mid["cents"] > 550:
+        raise SystemExit(f"a projection between $3 and $5.50 was not refused: {mid}")
     ref = lean_data.reference_projection()
     if lean_data.over_cap(ref["cents"]):
         raise SystemExit(f"reference projection exceeds the cap: {ref}")
@@ -133,7 +139,7 @@ def check_fixture_and_dry_run() -> None:
         clips = root / "clips.jsonl"
         clips.write_text(json.dumps({"path": "a.ogg", "duration_s": 300, "start_s": 0}) + "\n", encoding="utf-8")
         out = root / "out"
-        rc = lean_prep.main(["--speed-test", "--fixture", str(clips), "--out", str(out), "--hourly-cents", "59", "--cap-cents", "550"])
+        rc = lean_prep.main(["--speed-test", "--fixture", str(clips), "--out", str(out), "--hourly-cents", "59", "--cap-cents", "300"])
         if rc != 0:
             raise SystemExit(f"fixture speed test failed: {rc}")
         report = json.loads((out / "speed_test.json").read_text(encoding="utf-8"))
@@ -159,7 +165,7 @@ def check_fixture_and_dry_run() -> None:
     if proc.returncode != 0:
         raise SystemExit(proc.stdout + proc.stderr)
     text = proc.stdout
-    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "1000"):
+    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "1000", "$3.00", "6 h"):
         if needle not in text:
             raise SystemExit(f"dry run missing {needle}:\n{text}")
     if "creating the pod" in text.lower():

@@ -24,4 +24,4 @@ fi
 log "watchdog started"
 cd "$dest"
 exec python3 runpod/lean_prep.py --pod --out /workspace/pilot-out --work /workspace/work/lean \
-  --hourly-cents "${PILOT_HOURLY_CENTS:-59}" --cap-cents "${PILOT_MAX_USD_CENTS:-550}"
+  --hourly-cents "${PILOT_HOURLY_CENTS:-59}" --cap-cents "${PILOT_MAX_USD_CENTS:-300}"
