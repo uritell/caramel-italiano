@@ -474,6 +474,100 @@ def check_stale_heartbeat() -> None:
     print("stale heartbeat ok")
 
 
+def check_pod_smoke() -> None:
+    """Real --pod path with tiny caps. The token writer is the real _BatchWriter."""
+    import signal
+    import threading
+    import time
+    import wave
+
+    import numpy as np
+    import tokenize_store
+
+    saved_caps = (lean_data.VOX_CAP_H, lean_data.MLS_ALREADY_H, lean_data.MLS_KEEP_H)
+    saved_open = lean_prep._http_open
+    saved_mimi = tokenize_store._load_mimi
+    saved_encode = tokenize_store._encode_channel
+    saved_term = signal.getsignal(signal.SIGTERM)
+    lean_data.VOX_CAP_H = 0.06
+    lean_data.MLS_ALREADY_H = 0.15
+    lean_data.MLS_KEEP_H = 0.06
+
+    def wav_bytes(seconds: float = 1.0) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(24000)
+            handle.writeframes(b"\x00\x01" * int(24000 * seconds))
+        return buf.getvalue()
+
+    def tar_bytes(members: list[tuple[str, bytes]], gz: bool = False) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz" if gz else "w") as tar:
+            for name, payload in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+        return buf.getvalue()
+
+    clip = wav_bytes()
+    vox_blob = tar_bytes([("2015/clip.wav", clip)])
+    mls_blob = tar_bytes([("it/a.wav", clip), ("it/b.wav", clip)], gz=True)
+
+    def opener(url, start):
+        blob = mls_blob if "mls" in url else vox_blob
+        return io.BytesIO(blob[int(start or 0):])
+
+    def load_mimi(_device):
+        return object()
+
+    def encode_channel(_mimi, wave_arr, _device, _chunk):
+        time.sleep(0.002)
+        n = max(1, int(len(np.reshape(wave_arr, -1)) / 1920))
+        return np.ones((n, 8), dtype=np.int64)
+
+    lean_prep._http_open = opener
+    tokenize_store._load_mimi = load_mimi
+    tokenize_store._encode_channel = encode_channel
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            work = Path(tmp) / "work"
+
+            def approve() -> None:
+                while True:
+                    if (out / "speed_test.json").is_file():
+                        (out / "restore").mkdir(parents=True, exist_ok=True)
+                        (out / "restore" / "READY").write_text("ok\n", encoding="utf-8")
+                        return
+                    time.sleep(0.2)
+
+            threading.Thread(target=approve, daemon=True).start()
+            rc = lean_prep.main([
+                "--pod", "--out", str(out), "--work", str(work),
+                "--hourly-cents", "59", "--cap-cents", "272",
+            ])
+            failed = (out / "FAILED").read_text(encoding="utf-8") if (out / "FAILED").is_file() else ""
+            if rc != 0 or "NameError" in failed:
+                raise SystemExit(f"pod smoke rc={rc}\n{failed}")
+            if not (out / "DONE").is_file():
+                raise SystemExit("pod smoke did not write DONE")
+            store = out / "stores" / lean_data.STORE_VOX
+            meta = json.loads((store / "meta.json").read_text(encoding="utf-8"))
+            if meta.get("clips", 0) < 1 or not (store / "tokens.bin").is_file():
+                raise SystemExit(f"real writer did not flush tokens: {meta}")
+            if not (out / "stores" / lean_data.STORE_MLS).is_dir():
+                raise SystemExit("mls _BatchWriter was not constructed")
+    finally:
+        lean_data.VOX_CAP_H, lean_data.MLS_ALREADY_H, lean_data.MLS_KEEP_H = saved_caps
+        lean_prep._http_open = saved_open
+        tokenize_store._load_mimi = saved_mimi
+        tokenize_store._encode_channel = saved_encode
+        signal.signal(signal.SIGTERM, saved_term)
+    print("pod smoke ok")
+
+
 def main() -> int:
     check_year_and_segments()
     check_hours()
@@ -488,6 +582,7 @@ def main() -> int:
     check_budget_stop()
     check_heartbeat_file()
     check_stale_heartbeat()
+    check_pod_smoke()
     print("lean test ok")
     return 0
 

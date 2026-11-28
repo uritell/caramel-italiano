@@ -686,8 +686,6 @@ def _encode_store(clips: list[dict], out: Path, seconds: float = 0.0) -> tuple[f
 
 def _run_pod(args) -> int:
     """Five minutes first, then the launcher decides, then one file at a time."""
-    from tokenize_store import _BatchWriter
-
     install_fault_handlers(args.out)
     hb = Heartbeat(args.out)
     hb.start()
@@ -705,6 +703,8 @@ def _frames_of(writer) -> int:
 
 
 def _run_pod_body(args, hb: Heartbeat) -> int:
+    from tokenize_store import _BatchWriter
+
     work = args.work
     work.mkdir(parents=True, exist_ok=True)
     _write(args.out / "ATTRIBUTION.txt", lean_data.attribution_text())
