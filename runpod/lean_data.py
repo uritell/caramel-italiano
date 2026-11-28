@@ -1,7 +1,7 @@
 """Plan the lean Italian audio add-on. No network and no pod.
 
 VoxPopuli Italian unlabelled audio for 2015 only, from the official tars
-``it_2015.tar`` and ``it_2015_2.tar`` (CC0), capped at 1,000 h. Plus the
+``it_2015.tar`` and ``it_2015_2.tar`` (CC0), capped at 700 h. Plus the
 MLS Italian hours that are not already in the mono store: the archive is
 257.83 h and the mono store already took the first 100 h in archive order,
 so about 158 h remain.
@@ -19,7 +19,7 @@ import cost
 VOX_BASE = "https://dl.fbaipublicfiles.com/voxpopuli/audios"
 VOX_TARS = ("it_2015.tar", "it_2015_2.tar")
 VOX_YEAR = "2015"
-VOX_CAP_H = 1000.0
+VOX_CAP_H = 700.0
 MLS_URL = "https://dl.fbaipublicfiles.com/mls/mls_italian.tar.gz"
 MLS_TOTAL_H = 257.83
 MLS_ALREADY_H = 100.0
@@ -27,8 +27,12 @@ MLS_KEEP_H = 158.0  # 257.83 - 100 = 157.83; 158 h holds the remainder
 SEGMENT_S = 12.0  # prepare_audio.TURN_CAP_S, the mono turn length
 MIN_SEGMENT_S = 0.2
 SPEED_TEST_S = 300.0  # five minutes
-# Allowance for the tars, not a measurement. The speed test replaces the encode term.
+# Fallback when the sample did not measure a download rate. The speed test
+# replaces this with sample_bytes / measured bytes-per-second.
 DOWNLOAD_ALLOWANCE_S = 30 * 60
+# Stop taking new members this long before the wall cap, so the pod can
+# finish the current file and write DONE instead of being killed.
+ENCODE_BUDGET_MARGIN_S = 10 * 60
 # H100 mono factor from option A. Dry-run labels it as that measurement.
 # The pod's five-minute encode is what the launcher trusts.
 REFERENCE_RTF = 1145.0
@@ -134,6 +138,22 @@ def mls_remainder(durations_s: list[float], skip_hours: float = MLS_ALREADY_H, k
     return take_hours(rest, keep_hours)
 
 
+def encode_budget_s(wall_s: int = MAX_WALL_S) -> int:
+    """Seconds of bulk encode before the pod stops on its own."""
+    return max(0, int(wall_s) - ENCODE_BUDGET_MARGIN_S)
+
+
+def projected_download_s(sample_bytes: int, download_s: float, sample_audio_s: float, hours: float | None = None) -> tuple[float, float]:
+    """Scale the sample's byte rate up to the planned audio. Returns (seconds, MB/s)."""
+    if sample_bytes <= 0 or download_s <= 0 or sample_audio_s <= 0:
+        return float(DOWNLOAD_ALLOWANCE_S), 0.0
+    rate = sample_bytes / download_s
+    mb_per_s = rate / 1e6
+    total_audio = (planned_hours() if hours is None else hours) * 3600.0
+    total_bytes = (sample_bytes / sample_audio_s) * total_audio
+    return total_bytes / rate, mb_per_s
+
+
 def project_cost(audio_hours: float, rtf: float, hourly_cents: int, download_s: float = DOWNLOAD_ALLOWANCE_S) -> dict:
     """Cents for download allowance plus encode. rtf is audio-seconds per encode-second."""
     if rtf <= 0:
@@ -169,11 +189,23 @@ def reference_projection(hourly_cents: int = A40_HOURLY_CENTS) -> dict:
     return proj
 
 
-def speed_report(audio_s: float, encode_s: float, hourly_cents: int, cap_cents: int = MAX_USD_CENTS) -> dict:
+def speed_report(
+    audio_s: float, encode_s: float, hourly_cents: int, cap_cents: int = MAX_USD_CENTS,
+    end_to_end_s: float | None = None, download_s: float | None = None, download_mbps: float | None = None,
+) -> dict:
+    """``rtf`` is encode-only. The dollar projection uses the whole-slice rate."""
     if audio_s <= 0 or encode_s <= 0:
         raise ValueError("speed test needs positive audio and encode time")
+    whole_s = encode_s if end_to_end_s is None else end_to_end_s
+    if whole_s <= 0:
+        raise ValueError("end to end time must be positive")
     rtf = audio_s / encode_s
-    proj = project_cost(planned_hours(), rtf, hourly_cents)
+    end_to_end = audio_s / whole_s
+    allowance = DOWNLOAD_ALLOWANCE_S if download_s is None else download_s
+    proj = project_cost(planned_hours(), end_to_end, hourly_cents, download_s=allowance)
+    proj["rtf"] = rtf
+    proj["end_to_end_rtf"] = end_to_end
+    proj["download_mbps"] = download_mbps
     proj["speed_audio_s"] = audio_s
     proj["speed_encode_s"] = encode_s
     proj["measured"] = True

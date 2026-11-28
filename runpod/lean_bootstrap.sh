@@ -3,7 +3,8 @@
 set -euo pipefail
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 mkdir -p /workspace/pilot-out/logs /workspace/work
-exec >>/workspace/pilot-out/logs/bootstrap.log 2>&1
+# Tee to both logs. A plain redirect to bootstrap.log left job.log empty.
+exec > >(tee -a /workspace/pilot-out/logs/bootstrap.log /workspace/pilot-out/logs/job.log >/dev/null) 2>&1
 log "lean bootstrap"
 
 repo="${CARAMEL_REPO_URL:-https://github.com/uritell/caramel-italiano.git}"
