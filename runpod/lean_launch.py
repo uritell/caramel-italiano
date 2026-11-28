@@ -23,7 +23,8 @@ import cost
 import graphql_api
 import lean_data
 from chat_launch import CANDIDATES, EU_DATACENTERS, choose_gpu
-from launch import IMAGE, docker_args_json, proxy_base, pull_outputs, bootstrap_raw_url
+from chat_upload import notify_ready
+from launch import IMAGE, docker_args_json, proxy_base, pull_outputs, pull_server_answered, bootstrap_raw_url
 
 HERE = Path(__file__).resolve().parent
 
@@ -139,6 +140,8 @@ def dry_run(repo_url: str, repo_ref: str, cap_cents: int = lean_data.MAX_USD_CEN
     print(lean_data.explain_plan(cap_cents))
     print()
     print("pull: tokens.bin, index.npy, meta.json, ATTRIBUTION.txt. Streamed. No raw audio.")
+    print("pull server: lean_bootstrap.sh starts pull_server.py on 8080 before any download.")
+    print("if 8080 is not reachable within 10 min of RUNNING, the launcher terminates.")
     print("Dry run finished. No pod was created. No RunPod API key was sent.")
     if problems:
         print("dry run failed:")
@@ -159,6 +162,8 @@ def follow(
     """Watch the pod. A speed-test projection over the cap terminates before the full encode."""
     out_dir.mkdir(parents=True, exist_ok=True)
     decided = False
+    running_at = None
+    proxy_up = False
 
     def terminate(reason: str) -> None:
         print(f"{_stamp()} terminate ({reason})", flush=True)
@@ -183,6 +188,15 @@ def follow(
             print(f"{_stamp()} pod {pod_id} is gone", flush=True)
             return 2
         elapsed = int(time.time()) - epoch
+        status = str(current.get("desiredStatus") or current.get("status") or "")
+        if status == "RUNNING":
+            if running_at is None:
+                running_at = time.monotonic()
+            if not proxy_up:
+                proxy_up = pull_server_answered(pod_id, token)
+            if lean_data.proxy_missed(time.monotonic() - running_at, proxy_up):
+                terminate("pull server on 8080 did not answer within 10 min of RUNNING")
+                return 1
         rate = hourly
         raw = current.get("costPerHr")
         if isinstance(raw, (int, float)) and raw > 0:
@@ -197,13 +211,18 @@ def follow(
         report_path = out_dir / "speed_test.json"
         if report_path.is_file() and not decided:
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            decided = True
             if lean_data.over_cap(int(report.get("cents") or 0), cap_cents):
                 terminate(
                     f"speed test projects ${int(report['cents']) / 100:.2f}, over the cap"
                 )
                 return 1
-            print(f"speed test under the cap ({report.get('rtf')}x); letting the full encode run", flush=True)
+            try:
+                notify_ready(proxy_base(pod_id), token)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{_stamp()} approve retry: {exc}", flush=True)
+                continue
+            decided = True
+            print(f"speed test under the cap ({report.get('rtf')}x); bulk download may start", flush=True)
         if reason:
             terminate(reason)
             return 0

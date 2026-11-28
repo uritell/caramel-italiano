@@ -165,9 +165,18 @@ def check_fixture_and_dry_run() -> None:
     if proc.returncode != 0:
         raise SystemExit(proc.stdout + proc.stderr)
     text = proc.stdout
-    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "1000", "$3.00", "6 h"):
+    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "1000", "$3.00", "6 h", "pull_server.py", "10 min of RUNNING"):
         if needle not in text:
             raise SystemExit(f"dry run missing {needle}:\n{text}")
+    boot = (HERE / "lean_bootstrap.sh").read_text(encoding="utf-8")
+    pull_at = boot.find("pull_server.py")
+    prep_at = boot.find("lean_prep.py")
+    if pull_at < 0 or prep_at < 0 or pull_at > prep_at:
+        raise SystemExit("lean_bootstrap.sh must start pull_server.py before lean_prep.py")
+    if not lean_data.proxy_missed(10 * 60, False):
+        raise SystemExit("10 min without 8080 must fail")
+    if lean_data.proxy_missed(10 * 60 - 1, False) or lean_data.proxy_missed(10 * 60, True):
+        raise SystemExit("proxy deadline fired too early or while the server was up")
     if "creating the pod" in text.lower():
         raise SystemExit("dry run tried to create a pod")
     print("fixture and dry run ok")

@@ -36,6 +36,8 @@ A40_HOURLY_CENTS = 59
 # Data prep only. The approved $4–5.50 total also has to cover the later train.
 MAX_USD_CENTS = 300  # $3.00
 MAX_WALL_S = 6 * 3600
+# Launcher gives up if the pull server is still down this long after RUNNING.
+PROXY_WAIT_S = 10 * 60
 DISK_GB = 200
 STORE_VOX = "mono_voxpopuli"
 STORE_MLS = "mono_mls2"
@@ -177,6 +179,11 @@ def speed_report(audio_s: float, encode_s: float, hourly_cents: int, cap_cents: 
     return proj
 
 
+def proxy_missed(running_s: float, proxy_up: bool, limit_s: float = PROXY_WAIT_S) -> bool:
+    """True when 8080 has not answered within the wait after the pod is RUNNING."""
+    return (not proxy_up) and running_s >= limit_s
+
+
 def attribution_text() -> str:
     return "\n".join(ATTRIBUTION[key] for key in ("voxpopuli_it_2015", "mls_it_remainder")) + "\n"
 
@@ -196,7 +203,9 @@ def explain_plan(cap_cents: int = MAX_USD_CENTS) -> str:
         f"disk {DISK_GB} GB, terminateAfter set",
         f"reference projection: ${ref['cents'] / 100:.2f} "
         f"({ref['total_s'] / 3600:.2f} h). {ref['note']}.",
-        "the pod encodes 5 min first; the launcher refuses the rest if that projection exceeds the cap",
+        "the pod encodes 5 min of the first tar members before the bulk download",
+        "pull server listens on 8080 before that download; "
+        "the launcher terminates if it is not up within 10 min of RUNNING",
     ]
     if over_cap(ref["cents"], cap_cents):
         lines.append("REFUSING: the reference projection is already over the cap.")
