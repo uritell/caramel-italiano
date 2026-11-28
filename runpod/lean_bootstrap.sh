@@ -32,6 +32,38 @@ if [[ -n "${PILOT_PULL_TOKEN:-}" ]]; then
 else
   log "PILOT_PULL_TOKEN unset; pull server not started"
 fi
+# Same packages as the training pod (transformers, torch, …). Reuses install_pod.
+# shellcheck source=pod_env.sh
+source "$dest/runpod/pod_env.sh"
+PY=python3
+if ! install_pod > /workspace/pilot-out/logs/install.log 2>&1; then
+  {
+    echo "install_pod failed"
+    tail -n 120 /workspace/pilot-out/logs/install.log 2>/dev/null || true
+  } > /workspace/pilot-out/FAILED
+  log "install_pod failed"
+  exit 1
+fi
+log "install_pod done ($PY)"
+# Prove Mimi can load before any audio download. A failure is pullable.
+export PYTHONPATH="$dest/runpod${PYTHONPATH:+:$PYTHONPATH}"
+if ! "$PY" -c 'import traceback, sys
+try:
+    import transformers, torch
+    from tokenize_store import _load_mimi
+    _load_mimi("cuda" if torch.cuda.is_available() else "cpu")
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+' > /workspace/pilot-out/logs/preflight.log 2>&1; then
+  {
+    echo "preflight failed: import transformers, torch; load Mimi"
+    cat /workspace/pilot-out/logs/preflight.log 2>/dev/null || true
+  } > /workspace/pilot-out/FAILED
+  log "mimi preflight failed"
+  exit 1
+fi
+log "mimi preflight ok"
 cd "$dest"
-exec python3 runpod/lean_prep.py --pod --out /workspace/pilot-out --work /workspace/work/lean \
+exec "$PY" runpod/lean_prep.py --pod --out /workspace/pilot-out --work /workspace/work/lean \
   --hourly-cents "${PILOT_HOURLY_CENTS:-59}" --cap-cents "${PILOT_MAX_USD_CENTS:-300}"

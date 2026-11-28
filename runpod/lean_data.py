@@ -38,6 +38,8 @@ MAX_USD_CENTS = 300  # $3.00
 MAX_WALL_S = 6 * 3600
 # Launcher gives up if the pull server is still down this long after RUNNING.
 PROXY_WAIT_S = 10 * 60
+# After 8080 answers, the speed test has to show up or the pod is stopped.
+SPEED_REPORT_WAIT_S = 15 * 60
 DISK_GB = 200
 STORE_VOX = "mono_voxpopuli"
 STORE_MLS = "mono_mls2"
@@ -182,6 +184,11 @@ def speed_report(audio_s: float, encode_s: float, hourly_cents: int, cap_cents: 
 def proxy_missed(running_s: float, proxy_up: bool, limit_s: float = PROXY_WAIT_S) -> bool:
     """True when 8080 has not answered within the wait after the pod is RUNNING."""
     return (not proxy_up) and running_s >= limit_s
+
+
+def speed_report_missed(proxy_up_s: float, have_report: bool, limit_s: float = SPEED_REPORT_WAIT_S) -> bool:
+    """True when 8080 has been up this long and speed_test.json is still absent."""
+    return (not have_report) and proxy_up_s >= limit_s
 
 
 def attribution_text() -> str:

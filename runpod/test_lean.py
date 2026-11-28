@@ -177,9 +177,108 @@ def check_fixture_and_dry_run() -> None:
         raise SystemExit("10 min without 8080 must fail")
     if lean_data.proxy_missed(10 * 60 - 1, False) or lean_data.proxy_missed(10 * 60, True):
         raise SystemExit("proxy deadline fired too early or while the server was up")
+    if not lean_data.speed_report_missed(15 * 60, False):
+        raise SystemExit("15 min without speed_test.json must fail")
+    if lean_data.speed_report_missed(15 * 60 - 1, False) or lean_data.speed_report_missed(15 * 60, True):
+        raise SystemExit("speed-test deadline fired too early or after the report existed")
+    for earlier, later in (
+        ("pull_server.py", "install_pod"),
+        ("install_pod", "import transformers, torch"),
+        ("_load_mimi", "lean_prep.py"),
+    ):
+        if boot.find(earlier) < 0 or boot.find(later) < 0 or boot.find(earlier) > boot.find(later):
+            raise SystemExit(f"lean_bootstrap.sh must run {earlier} before {later}")
     if "creating the pod" in text.lower():
         raise SystemExit("dry run tried to create a pod")
     print("fixture and dry run ok")
+
+
+def _install_pod_packages(text: str) -> list[str]:
+    import re
+
+    match = re.search(r"^install_pod\(\) \{\n(.*)\n\}", text, re.M | re.S)
+    if not match:
+        raise SystemExit("install_pod() not found")
+    pkgs: list[str] = []
+    buf = ""
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            buf += stripped[:-1] + " "
+            continue
+        buf += " " + stripped
+        if "pip install" not in buf:
+            buf = ""
+            continue
+        tokens = buf.split()
+        i = tokens.index("install") + 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("||", "true"):
+                break
+            if tok.startswith("-"):
+                i += 2 if tok in ("--python", "--index-url") else 1
+                continue
+            if tok.startswith("$") or tok.startswith("http"):
+                i += 1
+                continue
+            pkgs.append(tok.strip("'\""))
+            i += 1
+        buf = ""
+    return pkgs
+
+
+def _packages_via_install_pod(script: str, env: str) -> list[str]:
+    if "pod_env.sh" not in script or "install_pod" not in script:
+        raise SystemExit("script does not reuse install_pod from pod_env.sh")
+    own = [
+        line.strip() for line in script.splitlines()
+        if "pip install" in line and not line.strip().startswith("#")
+    ]
+    if own:
+        raise SystemExit("script has its own pip install:\n" + "\n".join(own))
+    return _install_pod_packages(env)
+
+
+def check_same_packages() -> None:
+    env = (HERE / "pod_env.sh").read_text(encoding="utf-8")
+    pod_script = (HERE / "pod_run.sh").read_text(encoding="utf-8")
+    if "pod_env.sh" not in pod_script or "install_pod" not in pod_script:
+        raise SystemExit("pod_run.sh does not call the shared install_pod")
+    pod = _install_pod_packages(env)
+    lean = _packages_via_install_pod((HERE / "lean_bootstrap.sh").read_text(encoding="utf-8"), env)
+    if pod != lean:
+        raise SystemExit(f"package lists differ\n  pod: {pod}\n  lean: {lean}")
+    expected = [
+        "torch==2.9.1", "triton", "numpy", "transformers==4.46.3",
+        "safetensors", "soundfile", "huggingface_hub", "soxr",
+    ]
+    if pod != expected:
+        raise SystemExit(f"install_pod packages: {pod}")
+    print("install_pod packages match")
+
+
+def check_crash_writes_failed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "out"
+        original = lean_prep._run_pod
+
+        def boom(_args):
+            raise ModuleNotFoundError("No module named 'transformers'")
+
+        lean_prep._run_pod = boom
+        try:
+            rc = lean_prep.main(["--pod", "--out", str(out), "--work", str(Path(tmp) / "work")])
+        finally:
+            lean_prep._run_pod = original
+        if rc == 0:
+            raise SystemExit("a crash returned success")
+        text = (out / "FAILED").read_text(encoding="utf-8")
+        if "Traceback" not in text or "ModuleNotFoundError" not in text or "transformers" not in text:
+            raise SystemExit(f"FAILED is missing the traceback:\n{text}")
+    print("crash writes FAILED")
 
 
 def main() -> int:
@@ -188,6 +287,8 @@ def main() -> int:
     check_speed_gate()
     check_warmstart_mix()
     check_fixture_and_dry_run()
+    check_same_packages()
+    check_crash_writes_failed()
     print("lean test ok")
     return 0
 

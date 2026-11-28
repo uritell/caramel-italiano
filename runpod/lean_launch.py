@@ -164,6 +164,7 @@ def follow(
     decided = False
     running_at = None
     proxy_up = False
+    proxy_since = None
 
     def terminate(reason: str) -> None:
         print(f"{_stamp()} terminate ({reason})", flush=True)
@@ -194,6 +195,8 @@ def follow(
                 running_at = time.monotonic()
             if not proxy_up:
                 proxy_up = pull_server_answered(pod_id, token)
+            if proxy_up and proxy_since is None:
+                proxy_since = time.monotonic()
             if lean_data.proxy_missed(time.monotonic() - running_at, proxy_up):
                 terminate("pull server on 8080 did not answer within 10 min of RUNNING")
                 return 1
@@ -208,6 +211,14 @@ def follow(
             pull_outputs(current, out_dir, token, "")
         except Exception as exc:  # noqa: BLE001
             print(f"{_stamp()} pull retry: {exc}", flush=True)
+        if (out_dir / "FAILED").is_file():
+            terminate("FAILED")
+            return 1
+        if proxy_since is not None and lean_data.speed_report_missed(
+            time.monotonic() - proxy_since, (out_dir / "speed_test.json").is_file(),
+        ):
+            terminate("no speed_test.json within 15 min of 8080 answering")
+            return 1
         report_path = out_dir / "speed_test.json"
         if report_path.is_file() and not decided:
             report = json.loads(report_path.read_text(encoding="utf-8"))
