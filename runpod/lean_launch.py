@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,7 @@ def build_env(
         "PILOT_OUT": "/workspace/pilot-out",
         "PILOT_PULL_PORT": "8080",
         "PILOT_LEAN_DATA": "1",
+        "PILOT_ENCODE_BUDGET_S": str(lean_data.encode_budget_s()),
         "CARAMEL_REPO_URL": repo_url,
         "CARAMEL_REPO_REF": repo_ref,
         "HF_HOME": "/workspace/work/hf",
@@ -155,9 +157,64 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+HEARTBEAT_STALE_S = 10 * 60
+PULL_TIMEOUT_S = 60
+PULL_ATTEMPTS = 3
+PULL_DEADLINE_S = 120
+
+
+def heartbeat_stale(doc: dict, now: float, limit_s: float = HEARTBEAT_STALE_S) -> bool:
+    """True when status.json is older than the limit. Missing fields are not stale."""
+    raw = doc.get("ts") or doc.get("main_loop_ts")
+    if not raw:
+        return False
+    try:
+        stamp = datetime.strptime(str(raw), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return now - stamp.timestamp() >= limit_s
+
+
+def read_status(out_dir: Path) -> dict | None:
+    path = out_dir / "status.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pull_with_deadline(
+    pod: dict, out_dir: Path, token: str, *,
+    timeout: int = PULL_TIMEOUT_S, attempts: int = PULL_ATTEMPTS, deadline: float = PULL_DEADLINE_S,
+    pull=None,
+) -> None:
+    """One pull at a time. A slow pull logs and the loop keeps going."""
+    if pull is None:
+        pull = pull_outputs
+    holder = getattr(pull_with_deadline, "thread", None)
+    if holder is not None and holder.is_alive():
+        print(f"{_stamp()} pull stuck, continuing", flush=True)
+        return
+
+    def work() -> None:
+        try:
+            pull(pod, out_dir, token, "", timeout=timeout, attempts=attempts)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{_stamp()} pull retry: {exc}", flush=True)
+
+    thread = threading.Thread(target=work, name="lean-pull", daemon=True)
+    pull_with_deadline.thread = thread
+    thread.start()
+    thread.join(deadline)
+    if thread.is_alive():
+        print(f"{_stamp()} pull stuck, continuing", flush=True)
+
+
 def follow(
     pod_id: str, api_key: str, token: str, epoch: int, hourly: int, out_dir: Path,
-    cap_cents: int = lean_data.MAX_USD_CENTS,
+    cap_cents: int = lean_data.MAX_USD_CENTS, sleep=None,
 ) -> int:
     """Watch the pod. A speed-test projection over the cap terminates before the full encode."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -165,11 +222,14 @@ def follow(
     running_at = None
     proxy_up = False
     proxy_since = None
+    last_doc: dict | None = None
+    pull_with_deadline.thread = None
+    pause = time.sleep if sleep is None else sleep
 
     def terminate(reason: str) -> None:
         print(f"{_stamp()} terminate ({reason})", flush=True)
         try:
-            pull_outputs({"id": pod_id}, out_dir, token, "")
+            pull_outputs({"id": pod_id}, out_dir, token, "", timeout=PULL_TIMEOUT_S, attempts=PULL_ATTEMPTS)
         except Exception as exc:  # noqa: BLE001
             print(f"pull before terminate failed: {exc}", flush=True)
         try:
@@ -178,7 +238,8 @@ def follow(
             print(f"TERMINATE FAILED: {exc}", flush=True)
 
     while True:
-        time.sleep(20)
+        print(f"{_stamp()} tick", flush=True)
+        pause(20)
         try:
             got = graphql_api.pod_status(pod_id, api_key)
         except (graphql_api.ApiError, TimeoutError, OSError) as exc:
@@ -187,6 +248,14 @@ def follow(
         current = got.get("pod") or {}
         if not current:
             print(f"{_stamp()} pod {pod_id} is gone", flush=True)
+            print(
+                f"{_stamp()} last status.json {json.dumps(last_doc) if last_doc else 'none'}",
+                flush=True,
+            )
+            print(
+                f"{_stamp()} FAILED={(out_dir / 'FAILED').is_file()} DONE={(out_dir / 'DONE').is_file()}",
+                flush=True,
+            )
             return 2
         elapsed = int(time.time()) - epoch
         status = str(current.get("desiredStatus") or current.get("status") or "")
@@ -206,11 +275,20 @@ def follow(
             rate = cost.dollars_to_cents_up(float(raw))
         spent = cost.cost_cents(elapsed, rate)
         reason = cost.stop_reason(elapsed, rate, lean_data.MAX_WALL_S, cap_cents)
-        print(f"{_stamp()} [cost] {elapsed}s {cost.format_usd(spent)}", flush=True)
-        try:
-            pull_outputs(current, out_dir, token, "")
-        except Exception as exc:  # noqa: BLE001
-            print(f"{_stamp()} pull retry: {exc}", flush=True)
+        print(f"{_stamp()} [cost] {elapsed}s {cost.format_usd(spent)} status {status}", flush=True)
+        pull_with_deadline(current, out_dir, token)
+        doc = read_status(out_dir)
+        if doc:
+            last_doc = doc
+            print(
+                f"{_stamp()} status.json phase={doc.get('phase')} member={doc.get('current_member')} "
+                f"audio_h_done={doc.get('audio_h_done')} frames={doc.get('frames')} "
+                f"end_to_end_rtf={doc.get('end_to_end_rtf')} main_loop_ts={doc.get('main_loop_ts')}",
+                flush=True,
+            )
+        if status == "RUNNING" and doc is not None and heartbeat_stale(doc, time.time()):
+            terminate("heartbeat stale")
+            return 1
         if (out_dir / "FAILED").is_file():
             terminate("FAILED")
             return 1
@@ -233,7 +311,11 @@ def follow(
                 print(f"{_stamp()} approve retry: {exc}", flush=True)
                 continue
             decided = True
-            print(f"speed test under the cap ({report.get('rtf')}x); bulk download may start", flush=True)
+            print(
+                f"speed test under the cap (encode {report.get('rtf')}x, "
+                f"end to end {report.get('end_to_end_rtf')}x); bulk download may start",
+                flush=True,
+            )
         if reason:
             terminate(reason)
             return 0

@@ -66,8 +66,8 @@ def check_year_and_segments() -> None:
 
 def check_hours() -> None:
     vox = lean_data.take_hours([3600.0] * 1200, lean_data.VOX_CAP_H)
-    if len(vox) != 1000:
-        raise SystemExit(f"vox cap kept {len(vox)} hours, not 1000")
+    if lean_data.VOX_CAP_H != 700 or len(vox) != 700:
+        raise SystemExit(f"vox cap kept {len(vox)} hours at {lean_data.VOX_CAP_H}, not 700")
     mls = [3600.0] * 300
     kept = lean_data.mls_remainder(mls)
     if len(kept) != int(lean_data.MLS_KEEP_H):
@@ -165,7 +165,7 @@ def check_fixture_and_dry_run() -> None:
     if proc.returncode != 0:
         raise SystemExit(proc.stdout + proc.stderr)
     text = proc.stdout
-    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "1000", "$3.00", "6 h", "pull_server.py", "10 min of RUNNING"):
+    for needle in ("it_2015.tar", "it_2015_2.tar", "No pod was created", "158", "700", "$3.00", "6 h", "pull_server.py", "10 min of RUNNING"):
         if needle not in text:
             raise SystemExit(f"dry run missing {needle}:\n{text}")
     boot = (HERE / "lean_bootstrap.sh").read_text(encoding="utf-8")
@@ -281,6 +281,199 @@ def check_crash_writes_failed() -> None:
     print("crash writes FAILED")
 
 
+def _writer():
+    class Writer:
+        def add(self, frames, audio_s, encode_s):
+            return None
+
+        def flush(self):
+            return None
+
+    return Writer()
+
+
+def check_decode_once() -> None:
+    calls = []
+
+    def read_mono(path):
+        calls.append(str(path))
+        return [0] * (24000 * 48)
+
+    clips = []
+    for path, count in (("a.ogg", 3), ("b.ogg", 1)):
+        for i in range(count):
+            clips.append({"path": path, "name": path, "start_s": i * 12, "duration_s": 12})
+    audio, _enc, _whole, rest = lean_prep._encode_until(
+        None, "cpu", _writer(), clips, 0, read_mono=read_mono, encode_fn=lambda _piece: [1],
+    )
+    if calls != ["a.ogg", "b.ogg"]:
+        raise SystemExit(f"read_audio ran {calls}, expected once per file")
+    if audio != 48 or rest:
+        raise SystemExit(f"encoded {audio}s rest={rest}")
+    print("decode once ok")
+
+
+def check_speed_counts_load() -> None:
+    import time as time_mod
+
+    def read_mono(_path):
+        time_mod.sleep(0.15)
+        return [0] * (24000 * 12)
+
+    clips = [{"path": "a.ogg", "name": "a.ogg", "start_s": 0, "duration_s": 12}]
+    audio, enc, whole, _rest = lean_prep._encode_until(
+        None, "cpu", _writer(), clips, 0, read_mono=read_mono, encode_fn=lambda _piece: [1],
+    )
+    report = lean_data.speed_report(audio, enc if enc > 0 else 1e-6, 59, end_to_end_s=whole)
+    if whole < 0.15 or report["end_to_end_rtf"] >= report["rtf"]:
+        raise SystemExit(f"load time did not lower the rate: enc={enc} whole={whole} {report}")
+    print("speed test counts load ok")
+
+
+def check_walk_retry() -> None:
+    blob = io.BytesIO()
+    with tarfile.open(fileobj=blob, mode="w") as tar:
+        info = tarfile.TarInfo("2015/a.ogg")
+        info.size = 100
+        tar.addfile(info, io.BytesIO(b"A" * 100))
+        info = tarfile.TarInfo("2015/b.ogg")
+        info.size = 5000
+        tar.addfile(info, io.BytesIO(b"B" * 5000))
+    raw = blob.getvalue()
+    opens: list[int] = []
+
+    class Flaky:
+        def __init__(self, data: bytes, fail_after_reads: int | None):
+            self.data = data
+            self.pos = 0
+            self.reads = 0
+            self.fail_after_reads = fail_after_reads
+
+        def read(self, n: int = -1) -> bytes:
+            self.reads += 1
+            if self.fail_after_reads is not None and self.reads > self.fail_after_reads:
+                raise ConnectionResetError("reset")
+            if n is None or n < 0:
+                n = len(self.data) - self.pos
+            chunk = self.data[self.pos:self.pos + n]
+            self.pos += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            return None
+
+    def opener(_url, start):
+        start = int(start or 0)
+        opens.append(start)
+        fail = 1 if len(opens) == 2 else None
+        return Flaky(raw[start:], fail)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        kept, _got = lean_prep.walk_tar(
+            "https://example.invalid/it_2015.tar", Path(tmp), mode="r|", check_year=True,
+            skip_names=set(), max_new_s=0, opener=opener, pause=lambda _s: None,
+            duration_of=lambda _path: 12.0,
+        )
+    if len(opens) < 3 or not (opens[1] > 0 and opens[2] == opens[1]):
+        raise SystemExit(f"did not reopen at the member offset: {opens}")
+    if sorted(row["name"] for row in kept) != ["a.ogg", "b.ogg"]:
+        raise SystemExit(f"members: {kept}")
+    print("walk_tar retry ok")
+
+
+def check_budget_stop() -> None:
+    if not lean_prep.over_encode_budget(600, 600) or lean_prep.over_encode_budget(599, 600):
+        raise SystemExit("budget comparison is wrong")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        lean_prep.finish_at_budget(out, 2 * 3600)
+        text = (out / "DONE").read_text(encoding="utf-8")
+        if "stopped at budget" not in text or "2.00 h" not in text:
+            raise SystemExit(text)
+    print("budget stop ok")
+
+
+def check_heartbeat_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        hb = lean_prep.Heartbeat(out)
+        hb.start()
+        try:
+            hb.update(phase="bulk-vox", current_member="a.ogg", audio_h_done=1.5, frames=10, end_to_end_rtf=40.0)
+            doc = json.loads((out / "status.json").read_text(encoding="utf-8"))
+        finally:
+            hb.stop()
+            if hb._thread is not None:
+                hb._thread.join(2)
+    for key in (
+        "ts", "phase", "current_member", "audio_h_done", "frames", "end_to_end_rtf",
+        "main_loop_ts", "disk_free_gb", "mem_available_mb", "gpu_mem_used_mb",
+    ):
+        if key not in doc:
+            raise SystemExit(f"status.json missing {key}: {doc}")
+    if doc["phase"] != "bulk-vox" or doc["current_member"] != "a.ogg":
+        raise SystemExit(doc)
+    print("heartbeat ok")
+
+
+def check_stale_heartbeat() -> None:
+    import contextlib
+    from datetime import datetime, timedelta, timezone
+
+    fresh = {"ts": "2026-11-28T10:00:00Z"}
+    now = datetime(2026, 11, 28, 10, 10, tzinfo=timezone.utc).timestamp()
+    if not lean_launch.heartbeat_stale(fresh, now):
+        raise SystemExit("10 min old heartbeat was not stale")
+    if lean_launch.heartbeat_stale(fresh, now - 120):
+        raise SystemExit("a fresh heartbeat was treated as stale")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        old = (datetime.now(timezone.utc) - timedelta(minutes=11)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (out / "status.json").write_text(json.dumps({
+            "ts": old, "phase": "bulk-vox", "current_member": "a.ogg",
+            "audio_h_done": 1.25, "frames": 8, "end_to_end_rtf": 20, "main_loop_ts": old,
+        }), encoding="utf-8")
+        terminated = []
+        saved = (
+            lean_launch.graphql_api.pod_status,
+            lean_launch.graphql_api.terminate_pod,
+            lean_launch.pull_outputs,
+            lean_launch.pull_server_answered,
+        )
+
+        def pod_status(pod_id, _api_key):
+            return {"pod": {"id": pod_id, "desiredStatus": "RUNNING", "costPerHr": 0.59}}
+
+        def terminate_pod(pod_id, _api_key):
+            terminated.append(pod_id)
+
+        lean_launch.graphql_api.pod_status = pod_status
+        lean_launch.graphql_api.terminate_pod = terminate_pod
+        lean_launch.pull_outputs = lambda *_a, **_k: "proxy"
+        lean_launch.pull_server_answered = lambda *_a, **_k: True
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = lean_launch.follow(
+                    "pod1", "key", "tok", int(datetime.now(timezone.utc).timestamp()), 59, out,
+                    sleep=lambda _s: None,
+                )
+        finally:
+            (
+                lean_launch.graphql_api.pod_status,
+                lean_launch.graphql_api.terminate_pod,
+                lean_launch.pull_outputs,
+                lean_launch.pull_server_answered,
+            ) = saved
+            lean_launch.pull_with_deadline.thread = None
+        text = buf.getvalue()
+        if rc != 1 or "heartbeat stale" not in text or terminated != ["pod1"]:
+            raise SystemExit(f"rc={rc} terminated={terminated}\n{text}")
+        if "status.json" not in text or "bulk-vox" not in text:
+            raise SystemExit(f"tick did not print status.json:\n{text}")
+    print("stale heartbeat ok")
+
+
 def main() -> int:
     check_year_and_segments()
     check_hours()
@@ -289,6 +482,12 @@ def main() -> int:
     check_fixture_and_dry_run()
     check_same_packages()
     check_crash_writes_failed()
+    check_decode_once()
+    check_speed_counts_load()
+    check_walk_retry()
+    check_budget_stop()
+    check_heartbeat_file()
+    check_stale_heartbeat()
     print("lean test ok")
     return 0
 

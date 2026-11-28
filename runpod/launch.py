@@ -597,10 +597,12 @@ def _stream_to(
 def _pull_http_base(
     base: str, dest: Path, token: str, include_ckpt: bool | None = None,
     chunk_bytes: int = PULL_CHUNK_BYTES, pause=time.sleep, attempts: int = 8,
-    on_file=None,
+    on_file=None, timeout: int = 300,
 ) -> bool:
     try:
-        listing = json.loads(_http_get(base.rstrip("/") + "/", token, pause=pause, attempts=attempts))
+        listing = json.loads(_http_get(
+            base.rstrip("/") + "/", token, timeout=timeout, pause=pause, attempts=attempts,
+        ))
     except Exception as exc:  # noqa: BLE001
         print(f"HTTP list {base} failed: {exc}", flush=True)
         return False
@@ -634,7 +636,7 @@ def _pull_http_base(
             continue
         nbytes = _stream_to(
             base.rstrip("/") + "/" + rel, token, target,
-            pause=pause, attempts=attempts, chunk_bytes=chunk_bytes,
+            timeout=timeout, pause=pause, attempts=attempts, chunk_bytes=chunk_bytes,
         )
         pulled = True
         if on_file is not None:
@@ -645,12 +647,14 @@ def _pull_http_base(
     return pulled
 
 
-def _pull_http(pod: dict, dest: Path, token: str, include_ckpt: bool | None = None) -> bool:
+def _pull_http(pod: dict, dest: Path, token: str, include_ckpt: bool | None = None, timeout: int = 300, attempts: int = 8) -> bool:
     found = _public_port(pod, 8080)
     if not found:
         return False
     ip, port = found
-    return _pull_http_base(f"http://{ip}:{port}", dest, token, include_ckpt=include_ckpt)
+    return _pull_http_base(
+        f"http://{ip}:{port}", dest, token, include_ckpt=include_ckpt, timeout=timeout, attempts=attempts,
+    )
 
 
 def upload_stores_chunked(pod_id: str, token: str, src: Path, chunk_bytes: int = 32 * 1024 * 1024) -> None:
@@ -716,17 +720,22 @@ def upload_restore(pod_id: str, token: str, src: Path) -> None:
     print(f"uploaded {sent} files and marked READY", flush=True)
 
 
-def pull_outputs(pod: dict, dest: Path, token: str, key_path: str, include_ckpt: bool | None = None) -> str:
+def pull_outputs(
+    pod: dict, dest: Path, token: str, key_path: str, include_ckpt: bool | None = None,
+    timeout: int = 300, attempts: int = 8,
+) -> str:
     """Proxy first. Direct ip:port is blocked from the launcher. SSH is last."""
     pod_id = str(pod.get("id") or "")
     include = include_checkpoints(include_ckpt)
     if pod_id:
         try:
-            if _pull_http_base(proxy_base(pod_id), dest, token, include_ckpt=include):
+            if _pull_http_base(
+                proxy_base(pod_id), dest, token, include_ckpt=include, timeout=timeout, attempts=attempts,
+            ):
                 return "proxy"
         except ValueError as exc:
             print(f"proxy url skipped: {exc}", flush=True)
-    if _pull_http(pod, dest, token, include_ckpt=include):
+    if _pull_http(pod, dest, token, include_ckpt=include, timeout=timeout, attempts=attempts):
         return "http"
     if _pull_ssh(pod, dest, key_path, include_ckpt=include):
         if pod_id:
