@@ -38,6 +38,44 @@ LR = "1e-4"
 STORES_DIR = "runpod/retrieved/mviebvzw3ht7hn/stores"
 
 
+def lean_mix(include_synth_stereo: bool = False) -> list[tuple[str, float]]:
+    """Sampling weights for the lean stores against the existing stereo store.
+
+    Stereo stays the heaviest input. The new mono pools are extra hours,
+    not a replacement for two-person audio. synth_stereo is optional.
+    """
+    if include_synth_stereo:
+        mix = [
+            ("stereo", 0.45),
+            ("synth_stereo", 0.15),
+            ("mono_voxpopuli", 0.25),
+            ("mono_mls2", 0.15),
+        ]
+    else:
+        mix = [
+            ("stereo", 0.55),
+            ("mono_voxpopuli", 0.30),
+            ("mono_mls2", 0.15),
+        ]
+    total = sum(weight for _, weight in mix)
+    if abs(total - 1.0) > 1e-9:
+        raise ValueError(f"lean weights sum to {total}, not 1")
+    if max(weight for _, weight in mix) != mix[0][1]:
+        raise ValueError("stereo must be the heaviest lean store")
+    return mix
+
+
+def lean_data_args(store_root, include_synth_stereo: bool = False) -> list[str]:
+    """``--data`` / ``--weights`` for train.py. store_root holds one directory per name."""
+    from pathlib import Path
+
+    mix = lean_mix(include_synth_stereo)
+    root = Path(store_root)
+    paths = [str(root / name) for name, _ in mix]
+    weights = [f"{weight:.2f}" for _, weight in mix]
+    return ["--data", *paths, "--weights", *weights]
+
+
 def training_plan(gpus: int = 1) -> dict:
     base = option_a_plan(gpus)
     s2, s3 = base["s2_steps"], base["s3_steps"]

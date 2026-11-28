@@ -307,7 +307,7 @@ def check_reader() -> None:
 
 
 def check_shell() -> None:
-    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh", "supervise.sh"):
+    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh", "supervise.sh", "lean_bootstrap.sh"):
         proc = subprocess.run(["bash", "-n", str(HERE / name)], capture_output=True, text=True)
         if proc.returncode != 0:
             raise SystemExit(proc.stderr)
@@ -719,6 +719,12 @@ def check_termination_guard() -> None:
     print("termination guard ok")
 
 
+def check_lean() -> None:
+    import test_lean
+    if test_lean.main() != 0:
+        raise SystemExit("lean test failed")
+
+
 def main() -> int:
     check_cost()
     check_option_a()
@@ -734,6 +740,7 @@ def main() -> int:
     check_upload_abort_pulls()
     check_stream_pull()
     check_termination_guard()
+    check_lean()
     print("self-check ok")
     return 0
 
