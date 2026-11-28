@@ -94,9 +94,16 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
         "--save_best",
     ], s3)
     if p.get("skip_stage1"):
+        if os.environ.get("PILOT_LEAN_DATA") == "1":
+            from warmstart import lean_data_args
+            data_args = lean_data_args(
+                Path(mono).parent,
+                include_synth_stereo=os.environ.get("PILOT_LEAN_SYNTH") == "1",
+            )
+        else:
+            data_args = ["--data", str(stereo), str(mono), "--weights", "0.8", "0.2"]
         stage2 = _one_gpu(py, [
-            "--data", str(stereo), str(mono),
-            "--weights", "0.8", "0.2",
+            *data_args,
             "--steps", str(p["s2_steps"]),
             "--warmup", str(p.get("s2_warmup", 8)),
             "--lr", str(p.get("lr", "1e-4")),
@@ -109,8 +116,7 @@ def full_commands(py: str, mono: Path, stereo: Path, dev: Path, runs: Path) -> l
             "--save_best",
         ], s2)
         stage3 = _one_gpu(py, [
-            "--data", str(stereo), str(mono),
-            "--weights", "0.8", "0.2",
+            *data_args,
             "--steps", str(p["s2_steps"] + p["s3_steps"]),
             "--resume", str(s2 / "ckpt.pt"),
             "--sched_start", str(p["s2_steps"]),
