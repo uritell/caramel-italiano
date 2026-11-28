@@ -4,9 +4,10 @@
     python3 runpod/lean_prep.py --speed-test --fixture runpod/testdata/lean
     python3 runpod/lean_prep.py --pod          # full run; speed test first
 
-``--pod`` is what lean_bootstrap.sh runs. It encodes five minutes, writes
-speed_test.json, and exits before the full encode when that projection is
-over the cap. Raw audio is not copied into the pull directory.
+``--pod`` downloads about five minutes from the first tar, encodes it, and
+writes speed_test.json for the launcher. Bulk download starts only after
+the launcher POSTs /ready. Later files are encoded and deleted one at a
+time, and the token store in the pull directory grows as it goes.
 """
 from __future__ import annotations
 
@@ -66,53 +67,86 @@ def encode_speed(clips: list[dict], encode, seconds: float = lean_data.SPEED_TES
     return audio_s, encode_s
 
 
-def stream_vox(url: str, dest: Path, hours_left: float) -> tuple[list[dict], float]:
-    """Stream one official tar. Stop at the hour cap. Abort if a member is not 2015."""
+class StopTar(Exception):
+    """The caller has all the audio it wants from this stream."""
+
+
+def walk_tar(
+    url: str,
+    dest: Path,
+    *,
+    mode: str,
+    check_year: bool,
+    skip_names: set[str],
+    max_new_s: float,
+    on_file=None,
+) -> tuple[list[dict], float]:
+    """Stream one tar. ``mode`` is ``r|`` or ``r|gz``.
+
+    Members in ``skip_names`` are discarded. New audio stops at ``max_new_s``
+    (0 means no limit). If ``on_file`` is set it is called with the file still
+    on disk, and the file is deleted afterwards. Otherwise the files stay.
+    """
     import tarfile
     import urllib.request
 
+    from download_open import _duration
+
     dest.mkdir(parents=True, exist_ok=True)
-    records = []
+    kept: list[dict] = []
     got_s = 0.0
-    cap_s = hours_left * 3600.0
     req = urllib.request.Request(url, headers={"User-Agent": "caramel-italiano-lean/1.0"})
     with urllib.request.urlopen(req, timeout=120) as resp:
-        tar = tarfile.open(fileobj=resp, mode="r|")
+        tar = tarfile.open(fileobj=resp, mode=mode)
         for member in tar:
-            if got_s >= cap_s:
+            if max_new_s and got_s >= max_new_s:
                 break
             if not member.isfile():
                 continue
-            if Path(member.name).suffix.lower() not in lean_data.AUDIO_EXT:
-                extracted = tar.extractfile(member)
-                if extracted is not None:
-                    while extracted.read(1 << 20):
-                        pass
-                continue
-            if lean_data.event_year(member.name) != lean_data.VOX_YEAR:
-                raise SystemExit(f"{url} member {member.name} is not a {lean_data.VOX_YEAR} event")
+            suffix = Path(member.name).suffix.lower()
             extracted = tar.extractfile(member)
             if extracted is None:
                 continue
-            path = dest / Path(member.name).name
-            path.write_bytes(extracted.read())
-            from download_open import _duration
-
+            name = Path(member.name).name
+            if suffix not in lean_data.AUDIO_EXT or name in skip_names or member.name in skip_names:
+                while extracted.read(1 << 20):
+                    pass
+                continue
+            if check_year and lean_data.event_year(member.name) != lean_data.VOX_YEAR:
+                raise SystemExit(f"{url} member {member.name} is not a {lean_data.VOX_YEAR} event")
+            path = dest / name
+            with path.open("wb") as fh:
+                while True:
+                    block = extracted.read(1 << 20)
+                    if not block:
+                        break
+                    fh.write(block)
             dur = _duration(path)
             if dur < lean_data.MIN_SEGMENT_S:
                 path.unlink(missing_ok=True)
                 continue
-            if got_s + dur > cap_s and got_s > 0:
-                path.unlink(missing_ok=True)
-                break
-            got_s += dur
-            records.append({
-                "source": "voxpopuli_it_2015",
+            stop_after = bool(max_new_s and got_s + dur > max_new_s and got_s > 0)
+            rec = {
+                "source": "voxpopuli_it_2015" if check_year else "mls_it",
                 "path": str(path),
+                "member": member.name,
+                "name": name,
                 "duration_s": round(dur, 3),
-                "year": lean_data.VOX_YEAR,
-            })
-    return records, got_s / 3600.0
+            }
+            if on_file is not None:
+                try:
+                    on_file(rec)
+                except StopTar:
+                    path.unlink(missing_ok=True)
+                    return kept, got_s
+                finally:
+                    path.unlink(missing_ok=True)
+            else:
+                kept.append(rec)
+            got_s += dur
+            if stop_after:
+                break
+    return kept, got_s
 
 
 def segments_for(records: list[dict]) -> list[dict]:
@@ -188,10 +222,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _encode_store(clips: list[dict], out: Path, seconds: float = 0.0) -> tuple[float, float]:
-    """Encode 12 s slices with the same Mimi settings as the mono store."""
-    from audioio import read_audio, resample, to_mono
-    from tokenize_store import SR, _BatchWriter, _encode_channel, _load_mimi
+def _open_mimi():
+    from tokenize_store import _load_mimi
 
     device = "cpu"
     try:
@@ -200,12 +232,19 @@ def _encode_store(clips: list[dict], out: Path, seconds: float = 0.0) -> tuple[f
             device = "cuda"
     except Exception:
         device = "cpu"
-    mimi = _load_mimi(device)
-    writer = _BatchWriter(out, lean_data.WIDTH, 2000)
+    return _load_mimi(device), device
+
+
+def _encode_until(mimi, device: str, writer, clips: list[dict], limit_s: float) -> tuple[float, float, list[dict]]:
+    """Encode slices until limit_s (0 means all). Returns audio, encode time, and the rest."""
+    from audioio import read_audio, resample, to_mono
+    from tokenize_store import SR, _encode_channel
+
     audio_s = 0.0
     encode_s = 0.0
+    used = 0
     for clip in clips:
-        if seconds and audio_s >= seconds:
+        if limit_s and audio_s >= limit_s:
             break
         wave, sr = read_audio(Path(clip["path"]))
         mono = to_mono(resample(wave, sr, SR)).reshape(-1)
@@ -218,38 +257,61 @@ def _encode_store(clips: list[dict], out: Path, seconds: float = 0.0) -> tuple[f
         writer.add(frames, float(clip["duration_s"]), dt)
         audio_s += float(clip["duration_s"])
         encode_s += dt
+        used += 1
     writer.flush()
+    return audio_s, encode_s, clips[used:]
+
+
+def wait_for_go(out: Path, timeout_s: int = 20 * 60) -> bool:
+    """Block until the launcher POSTs /ready (restore/READY) after reading the speed test."""
+    ready = out / "restore" / "READY"
+    deadline = time.time() + timeout_s
+    print("speed_test.json is pullable; waiting for the launcher before the bulk download", flush=True)
+    while time.time() < deadline:
+        if ready.is_file():
+            print("launcher approved the speed test", flush=True)
+            return True
+        time.sleep(5)
+    return False
+
+
+def _encode_store(clips: list[dict], out: Path, seconds: float = 0.0) -> tuple[float, float]:
+    """Encode slices with one Mimi load. Used by tests and the speed-test prefix."""
+    from tokenize_store import _BatchWriter
+
+    mimi, device = _open_mimi()
+    writer = _BatchWriter(out, lean_data.WIDTH, 2000)
+    audio_s, encode_s, _rest = _encode_until(mimi, device, writer, clips, seconds)
     return audio_s, encode_s
 
 
 def _run_pod(args) -> int:
+    """Five minutes first, then the launcher decides, then one file at a time."""
+    from tokenize_store import _BatchWriter
+
     work = args.work
     work.mkdir(parents=True, exist_ok=True)
-    vox_records = []
-    left = lean_data.VOX_CAP_H
+    _write(args.out / "ATTRIBUTION.txt", lean_data.attribution_text())
+    sample_dir = work / "sample"
+    sample: list[dict] = []
     for url in lean_data.vox_urls():
-        if left <= 0:
+        if sum(float(r["duration_s"]) for r in sample) >= lean_data.SPEED_TEST_S:
             break
-        got, hours = stream_vox(url, work / "vox", left)
-        vox_records.extend(got)
-        left -= hours
-    vox_clips = segments_for(vox_records)
-    from download_open import stream_audio, _mls_speaker
-
-    mls_raw = stream_audio(
-        lean_data.MLS_URL, work / "mls",
-        source="mls_it", split="italian",
-        max_audio_s=0, max_bytes=0, speaker_from_name=_mls_speaker,
-    )
-    durations = [float(row["duration_s"]) for row in mls_raw if float(row["duration_s"]) > 0]
-    n_skip = len(lean_data.take_hours(durations, lean_data.MLS_ALREADY_H))
-    n_keep = len(lean_data.mls_remainder(durations))
-    positive = [row for row in mls_raw if float(row["duration_s"]) > 0]
-    mls_kept = positive[n_skip:n_skip + n_keep]
-    mls_clips = segments_for(mls_kept)
-    _write(work / "ATTRIBUTION.txt", lean_data.attribution_text())
-    speed_clips = vox_clips or mls_clips
-    audio_s, encode_s = _encode_store(speed_clips, work / "speed", lean_data.SPEED_TEST_S)
+        got, _secs = walk_tar(
+            url, sample_dir, mode="r|", check_year=True, skip_names=set(),
+            max_new_s=lean_data.SPEED_TEST_S - sum(float(r["duration_s"]) for r in sample),
+            on_file=None,
+        )
+        sample.extend(got)
+    clips = segments_for(sample)
+    mimi, device = _open_mimi()
+    vox_store = args.out / "stores" / lean_data.STORE_VOX
+    vox_writer = _BatchWriter(vox_store, lean_data.WIDTH, 50)
+    audio_s, encode_s, rest = _encode_until(mimi, device, vox_writer, clips, lean_data.SPEED_TEST_S)
+    if audio_s <= 0:
+        _write(args.out / "FAILED", "speed test saw no audio\n")
+        print("speed test saw no audio", file=sys.stderr)
+        return 1
     report = lean_data.speed_report(audio_s, encode_s, args.hourly_cents, args.cap_cents)
     _write(args.out / "speed_test.json", json.dumps(report, indent=2) + "\n")
     print(
@@ -260,15 +322,61 @@ def _run_pod(args) -> int:
     try:
         gate(report, args.cap_cents)
     except SystemExit as exc:
+        for rec in sample:
+            Path(rec["path"]).unlink(missing_ok=True)
         _write(args.out / "FAILED", str(exc) + "\n")
         print(exc, file=sys.stderr)
         return 1
-    vox_store = work / "stores" / lean_data.STORE_VOX
-    mls_store = work / "stores" / lean_data.STORE_MLS
-    _encode_store(vox_clips, vox_store)
-    _encode_store(mls_clips, mls_store)
-    publish_tokens([vox_store, mls_store], args.out)
-    _write(args.out / "ATTRIBUTION.txt", lean_data.attribution_text())
+    if not wait_for_go(args.out):
+        _write(args.out / "FAILED", "launcher did not approve the speed test\n")
+        print("launcher did not approve the speed test", file=sys.stderr)
+        return 1
+    if rest:
+        _encode_until(mimi, device, vox_writer, rest, 0)
+    for rec in sample:
+        Path(rec["path"]).unlink(missing_ok=True)
+    done = {rec["name"] for rec in sample}
+    vox_left = lean_data.VOX_CAP_H * 3600.0 - audio_s
+
+    def encode_one(store_writer, rec: dict) -> None:
+        segs = segments_for([rec])
+        _encode_until(mimi, device, store_writer, segs, 0)
+
+    for url in lean_data.vox_urls():
+        if vox_left <= 0:
+            break
+
+        def on_vox(rec: dict, writer=vox_writer) -> None:
+            nonlocal vox_left
+            encode_one(writer, rec)
+            vox_left -= float(rec["duration_s"])
+
+        _added, _got = walk_tar(
+            url, work / "vox", mode="r|", check_year=True, skip_names=done,
+            max_new_s=max(0.0, vox_left), on_file=on_vox,
+        )
+    mls_store = args.out / "stores" / lean_data.STORE_MLS
+    mls_writer = _BatchWriter(mls_store, lean_data.WIDTH, 50)
+    skipped = 0.0
+    kept = 0.0
+    skip_cap = lean_data.MLS_ALREADY_H * 3600.0
+    keep_cap = lean_data.MLS_KEEP_H * 3600.0
+
+    def on_mls(rec: dict) -> None:
+        nonlocal skipped, kept
+        dur = float(rec["duration_s"])
+        if skipped < skip_cap and not (skipped > 0 and skipped + dur > skip_cap):
+            skipped += dur
+            return
+        if kept >= keep_cap or (kept > 0 and kept + dur > keep_cap):
+            raise StopTar()
+        encode_one(mls_writer, rec)
+        kept += dur
+
+    walk_tar(
+        lean_data.MLS_URL, work / "mls", mode="r|gz", check_year=False, skip_names=set(),
+        max_new_s=0, on_file=on_mls,
+    )
     _write(args.out / "DONE", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
     return 0
 

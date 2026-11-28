@@ -22,6 +22,16 @@ else
   nohup bash "$dest/runpod/watchdog.sh" </dev/null >>/workspace/pilot-out/logs/watchdog.log 2>&1 &
 fi
 log "watchdog started"
+# Same pull server as pod_run.sh, before any audio download, so the launcher
+# can read speed_test.json and the token shards on port 8080.
+if [[ -n "${PILOT_PULL_TOKEN:-}" ]]; then
+  PILOT_OUT="${PILOT_OUT:-/workspace/pilot-out}" PILOT_PULL_PORT="${PILOT_PULL_PORT:-8080}" \
+    python3 "$dest/runpod/pull_server.py" >>/workspace/pilot-out/logs/pull_server.log 2>&1 &
+  echo $! > /tmp/pull-server.pid
+  log "pull server on ${PILOT_PULL_PORT:-8080}"
+else
+  log "PILOT_PULL_TOKEN unset; pull server not started"
+fi
 cd "$dest"
 exec python3 runpod/lean_prep.py --pod --out /workspace/pilot-out --work /workspace/work/lean \
   --hourly-cents "${PILOT_HOURLY_CENTS:-59}" --cap-cents "${PILOT_MAX_USD_CENTS:-300}"
