@@ -307,7 +307,7 @@ def check_reader() -> None:
 
 
 def check_shell() -> None:
-    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh", "supervise.sh", "lean_bootstrap.sh"):
+    for name in ("pod_run.sh", "bootstrap.sh", "watchdog.sh", "supervise.sh", "lean_bootstrap.sh", "pod_env.sh"):
         proc = subprocess.run(["bash", "-n", str(HERE / name)], capture_output=True, text=True)
         if proc.returncode != 0:
             raise SystemExit(proc.stderr)

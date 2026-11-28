@@ -162,6 +162,15 @@ def segments_for(records: list[dict]) -> list[dict]:
     return rows
 
 
+def record_failure(out: Path, exc: BaseException) -> None:
+    """Write a traceback the launcher can pull. One file means stop the pod."""
+    import traceback
+
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    _write(out / "FAILED", text)
+    print(text, file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--pod", action="store_true", help="full pod run: speed test, then encode if under the cap")
@@ -176,7 +185,16 @@ def main(argv: list[str] | None = None) -> int:
         print("lean_prep.py: pass --fixture for a local check, or --pod on the machine", file=sys.stderr)
         return 2
     if args.pod and args.fixture is None:
-        return _run_pod(args)
+        try:
+            return _run_pod(args)
+        except SystemExit as exc:
+            if not (args.out / "FAILED").is_file():
+                record_failure(args.out, exc)
+            code = exc.code
+            return code if isinstance(code, int) else 1
+        except Exception as exc:
+            record_failure(args.out, exc)
+            return 1
     clips = []
     if args.fixture is not None:
         for line in args.fixture.read_text(encoding="utf-8").splitlines():
